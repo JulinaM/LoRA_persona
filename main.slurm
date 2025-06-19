@@ -29,9 +29,9 @@ exec > "$LOG_FILE" 2>&1
 # --- 3. SELECT PYTHON SCRIPT TO RUN ---
 PYTHON_SCRIPT=""
 case $SCRIPT_CHOICE in
-    9)
-        echo "Selected script #8: A eight script"
-        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/0_run_finetune_bert_GCN.py" ;;
+    # 9)
+    #     echo "Selected script #8: A eight script"
+    #     PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/0_run_finetune_bert_GCN.py" ;;
     1)
         echo "Selected script #1: run_lora.py"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1_run_finetune_lora.py" ;;
@@ -56,6 +56,10 @@ case $SCRIPT_CHOICE in
     8)
         echo "Selected script #8: A eight script"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.3_run_finetune_lora_GCN.py" ;;
+    9)
+        echo "Selected script #9: A ninth script"
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.4_run_finetune_lora_MTL.py" ;;
+ 
     *)
         echo "Error: Invalid script choice '${SCRIPT_CHOICE}'."
         echo "Please choose a number defined in the script's case statement."

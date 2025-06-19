@@ -22,13 +22,15 @@ from peft import get_peft_model, LoraConfig, TaskType
 ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
 TEXT_COLUMN = "STATUS"
 DATA_FILE = "/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv"
-MODEL_CHECKPOINT_LLAMA = "meta-llama/Meta-Llama-3-8B"
+MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
 BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt_llama_mlp_lora_final" 
 my_token = "" # Your Hugging Face token
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
+print(f"Using Model: {MODEL_CHECKPOINT}")
+
 
 ## ---------------------------------------------------
 ## --- Custom Model Definition (Inheritance Method) ---
@@ -130,7 +132,7 @@ def load_and_prepare_data(file_path, text_col, target_col):
 ## --- Tokenizer (loaded once) ---
 ## ---------------------------------------------------
 print("Loading tokenizer...")
-tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT_LLAMA, token=my_token)
+tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, token=my_token)
 if tokenizer_llama.pad_token is None:
     tokenizer_llama.pad_token = tokenizer_llama.eos_token
 
@@ -150,7 +152,7 @@ for target_trait in ALL_TARGET_COLUMNS:
     # Initialize the custom model using the robust inheritance method
     print("\nInitializing custom LlamaForSequenceClassificationWithMLP model...")
     model = LlamaForSequenceClassificationWithMLP.from_pretrained(
-        MODEL_CHECKPOINT_LLAMA,
+        MODEL_CHECKPOINT,
         num_labels=2,
         torch_dtype=torch.bfloat16,
         device_map="auto",
