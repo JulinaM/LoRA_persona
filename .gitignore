@@ -1,0 +1,15 @@
+# Slurm output files
+*.slurm
+*.out
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Data, logs, and checkpoints
+data/
+logs/
+mypersonality/ckpt/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints
