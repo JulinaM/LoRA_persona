@@ -1,6 +1,7 @@
 # Slurm output files
-*.slurm
+slurm-*
 *.out
+test.slurm
 
 # Python caches
 __pycache__/

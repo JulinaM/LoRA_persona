@@ -15,6 +15,8 @@ from sklearn.metrics import accuracy_score, f1_score
 import torch
 from imblearn.over_sampling import RandomOverSampler
 import gc
+import json 
+
 
 ## ---------------------------------------------------
 ## --- Configuration ---
@@ -22,14 +24,22 @@ import gc
 DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
 DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
 ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
-MODEL_CHECKPOINT_LLAMA = "meta-llama/Meta-Llama-3-8B"
+# MODEL_CHECKPOINT_LLAMA = "meta-llama/Meta-Llama-3-8B"
+MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
 BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_lora_class_balanced" 
 my_token = ""
+try:
+    with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
+        keys = json.load(f)
+        my_token = keys['hf_read']
+except (FileNotFoundError, KeyError) as e:
+    print(f"Error reading token: {e}. Please ensure '../data/keys.json' exists and contains the 'hf_read' key.")
+    my_token = None 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
-
+print(f"Using ModelL: {MODEL_CHECKPOINT}")
 ## ---------------------------------------------------
 ## --- Data Loading and Metrics Functions ---
 ## ---------------------------------------------------
@@ -66,14 +76,13 @@ def compute_metrics(p):
     return {"accuracy": acc, "f1": f1}
 
 print("Loading tokenizer...")
-tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT_LLAMA, token=my_token)
+tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, token=my_token)
 if tokenizer_llama.pad_token is None:
     tokenizer_llama.pad_token = tokenizer_llama.eos_token
 
 # Load the raw dataframes first
 trainval_df, test1_df, test2_df = load_and_prepare_all_data()
 
-# <<< BEST PRACTICE: Define static configs once
 lora_config = LoraConfig(
     task_type=TaskType.SEQ_CLS,
     r=16,
@@ -95,15 +104,15 @@ training_args_template = TrainingArguments(
     weight_decay=0.01,
     lr_scheduler_type="cosine",
     group_by_length=True,
-    logging_dir=f"{BASE_OUTPUT_DIR}/logs",
-    report_to="tensorboard",
+    # logging_dir=f"{BASE_OUTPUT_DIR}/logs",
+    # report_to="tensorboard",
     save_total_limit=1, # Only save the best checkpoint
 )
 
 ## ---------------------------------------------------
 ## --- Main Execution Loop for All Traits ---
 ## ---------------------------------------------------
-for target_trait in ['cOPN', 'cEXT']:
+for target_trait in ALL_TARGET_COLUMNS:
     print("\n" + "="*80)
     print(f" PROCESSING TRAIT: {target_trait} ".center(80, "="))
     print("="*80)
@@ -134,7 +143,7 @@ for target_trait in ['cOPN', 'cEXT']:
     tokenized_dataset = trait_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
 
     model_llama = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_CHECKPOINT_LLAMA,
+        MODEL_CHECKPOINT,
         num_labels=2,
         torch_dtype=torch.bfloat16,
         device_map="auto"
