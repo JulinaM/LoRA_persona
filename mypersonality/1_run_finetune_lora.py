@@ -7,6 +7,8 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding,
+    EarlyStoppingCallback, # ADD THIS IMPORT
+
 )
 from peft import get_peft_model, LoraConfig, TaskType
 import numpy as np
@@ -88,7 +90,8 @@ lora_config = LoraConfig(
     # target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
 )
 training_args_template = TrainingArguments(
-    num_train_epochs=5,
+    # logging_dir=f"{BASE_OUTPUT_DIR}/logs",
+    num_train_epochs=10,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=8,
     learning_rate=2e-4,
@@ -97,13 +100,11 @@ training_args_template = TrainingArguments(
     save_strategy="epoch",
     load_best_model_at_end=True,
     bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-    metric_for_best_model="f1",
+    metric_for_best_model="f1", #greater_is_better=True
     weight_decay=0.01,
     lr_scheduler_type="cosine",
     group_by_length=True,
-    # logging_dir=f"{BASE_OUTPUT_DIR}/logs",
-    # report_to="tensorboard",
-    save_total_limit=1, # Only save the best checkpoint
+    save_total_limit=1,
 )
 
 # Load the raw dataframes first
@@ -160,6 +161,8 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
         eval_dataset=tokenized_dataset["validation"],
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
         compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+
     )
     trainer_llama.train()
 
