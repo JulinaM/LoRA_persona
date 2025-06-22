@@ -18,44 +18,38 @@ import gc
 import json 
 
 
-## ---------------------------------------------------
-## --- Configuration ---
-## ---------------------------------------------------
-DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
-DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
-ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
-# MODEL_CHECKPOINT_LLAMA = "meta-llama/Meta-Llama-3-8B"
-MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
-BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_lora_class_balanced" 
-my_token = ""
-try:
-    with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
-        keys = json.load(f)
-        my_token = keys['hf_read']
-except (FileNotFoundError, KeyError) as e:
-    print(f"Error reading token: {e}. Please ensure '../data/keys.json' exists and contains the 'hf_read' key.")
-    my_token = None 
+class Config:
+    DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
+    DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
+    ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
+    MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
+    # MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
+    # MODEL_CHECKPOINT = "tiiuae/falcon-7b"
+    BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_lora_class_balanced" 
+    def get_hf_token():
+        try:
+            with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
+                keys = json.load(f)
+                my_token = keys['hf_read']
+        except (FileNotFoundError, KeyError) as e:
+            print(f"Error reading token: {e}. Please ensure '../data/keys.json' exists and contains the 'hf_read' key.")
+            my_token = None 
+        return my_token
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
-print(f"Using ModelL: {MODEL_CHECKPOINT}")
-## ---------------------------------------------------
-## --- Data Loading and Metrics Functions ---
-## ---------------------------------------------------
+
 def load_and_prepare_all_data():
     print("--- Loading and Preparing All Datasets ---")
     def load_mypersonality_data():
-        df = pd.read_csv(DATA_URL_MYPERSONALITY, encoding='Windows-1252')
+        df = pd.read_csv(Config.DATA_URL_MYPERSONALITY, encoding='Windows-1252')
         df = df.rename(columns={'STATUS': 'text'})
         df['text'] = df['text'].fillna('')
-        df = df[['text'] + ALL_TARGET_COLUMNS]
-        for col in ALL_TARGET_COLUMNS:
+        df = df[['text'] + Config.ALL_TARGET_COLUMNS]
+        for col in Config.ALL_TARGET_COLUMNS:
             df[col] = df[col].apply(lambda x: 1 if str(x).lower() == 'y' else 0)
         return df
 
     def load_essay_data():
-        df = pd.read_csv(DATA_URL_ESSAY, encoding='utf-8')
+        df = pd.read_csv(Config.DATA_URL_ESSAY, encoding='utf-8')
         df['text'] = df['text'].fillna('')
         return df
 
@@ -75,20 +69,23 @@ def compute_metrics(p):
     acc = accuracy_score(labels, preds)
     return {"accuracy": acc, "f1": f1}
 
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
+print(f"Using ModelL: {Config.MODEL_CHECKPOINT}")
 print("Loading tokenizer...")
-tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, token=my_token)
+tokenizer_llama = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
 if tokenizer_llama.pad_token is None:
     tokenizer_llama.pad_token = tokenizer_llama.eos_token
-
-# Load the raw dataframes first
-trainval_df, test1_df, test2_df = load_and_prepare_all_data()
 
 lora_config = LoraConfig(
     task_type=TaskType.SEQ_CLS,
     r=16,
     lora_alpha=32,
-    lora_dropout=0.07,
+    lora_dropout=0.1, #0.1
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    # target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
 )
 training_args_template = TrainingArguments(
     num_train_epochs=5,
@@ -109,17 +106,16 @@ training_args_template = TrainingArguments(
     save_total_limit=1, # Only save the best checkpoint
 )
 
-## ---------------------------------------------------
-## --- Main Execution Loop for All Traits ---
-## ---------------------------------------------------
-for target_trait in ALL_TARGET_COLUMNS:
+# Load the raw dataframes first
+trainval_df, test1_df, test2_df = load_and_prepare_all_data()
+for target_trait in Config.ALL_TARGET_COLUMNS:
     print("\n" + "="*80)
     print(f" PROCESSING TRAIT: {target_trait} ".center(80, "="))
     print("="*80)
 
     print(f"\nBalancing training data for class labels in trait: {target_trait}")
     train_df, val_df = train_test_split(trainval_df, test_size=0.1, random_state=42, stratify=trainval_df[target_trait])
-    X_train = train_df.drop(columns=ALL_TARGET_COLUMNS)
+    X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
     y_train = train_df[target_trait]
     print(f"Original training distribution for {target_trait}: \n{y_train.value_counts(normalize=True)}")
     
@@ -143,7 +139,7 @@ for target_trait in ALL_TARGET_COLUMNS:
     tokenized_dataset = trait_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
 
     model_llama = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_CHECKPOINT,
+        Config.MODEL_CHECKPOINT,
         num_labels=2,
         torch_dtype=torch.bfloat16,
         device_map="auto"
@@ -152,7 +148,7 @@ for target_trait in ALL_TARGET_COLUMNS:
     model_llama_lora = get_peft_model(model_llama, lora_config)
     model_llama_lora.print_trainable_parameters()
 
-    output_dir_trait = os.path.join(BASE_OUTPUT_DIR, target_trait)
+    output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
     os.makedirs(output_dir_trait, exist_ok=True)
     training_args = training_args_template
     training_args.output_dir = output_dir_trait 

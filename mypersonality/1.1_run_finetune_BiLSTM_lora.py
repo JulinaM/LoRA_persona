@@ -1,10 +1,5 @@
 import os
-import torch
-import torch.nn as nn
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 from datasets import Dataset, DatasetDict
 from transformers import (
     AutoTokenizer,
@@ -12,44 +7,76 @@ from transformers import (
     Trainer,
     DataCollatorWithPadding,
 )
+from peft import get_peft_model, LoraConfig, TaskType
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+import torch
+import torch.nn as nn
+from imblearn.over_sampling import RandomOverSampler
+import gc
+import json 
 from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, LlamaModel
 from transformers.modeling_outputs import SequenceClassifierOutput
-from peft import get_peft_model, LoraConfig, TaskType
-
-## ---------------------------------------------------
-## --- Configuration ---
-## ---------------------------------------------------
-ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
-TEXT_COLUMN = "STATUS"
-DATA_FILE = "/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv"
-MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
-BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt_llama_mlp_lora_final" 
-my_token = "" # Your Hugging Face token
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
-print(f"Using Model: {MODEL_CHECKPOINT}")
 
 
-## ---------------------------------------------------
-## --- Custom Model Definition (Inheritance Method) ---
-## ---------------------------------------------------
-class LlamaForSequenceClassificationWithMLP(LlamaPreTrainedModel):
-    """
-    A custom Llama model for sequence classification that inherits from LlamaPreTrainedModel
-    for full compatibility with the Hugging Face ecosystem. This is the most robust way
-    to add a custom head.
-    """
-    def __init__(self, config, mlp_hidden_size=512, dropout_rate=0.2):
+class Config:
+    DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
+    DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
+    ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
+    MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
+    # MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
+    # MODEL_CHECKPOINT = "tiiuae/falcon-7b"
+    BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_lora_class_balanced" 
+    def get_hf_token():
+        try:
+            with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
+                keys = json.load(f)
+                my_token = keys['hf_read']
+        except (FileNotFoundError, KeyError) as e:
+            print(f"Error reading token: {e}. Please ensure '../data/keys.json' exists and contains the 'hf_read' key.")
+            my_token = None 
+        return my_token
+
+
+def load_and_prepare_all_data():
+    print("--- Loading and Preparing All Datasets ---")
+    def load_mypersonality_data():
+        df = pd.read_csv(Config.DATA_URL_MYPERSONALITY, encoding='Windows-1252')
+        df = df.rename(columns={'STATUS': 'text'})
+        df['text'] = df['text'].fillna('')
+        df = df[['text'] + Config.ALL_TARGET_COLUMNS]
+        for col in Config.ALL_TARGET_COLUMNS:
+            df[col] = df[col].apply(lambda x: 1 if str(x).lower() == 'y' else 0)
+        return df
+
+    def load_essay_data():
+        df = pd.read_csv(Config.DATA_URL_ESSAY, encoding='utf-8')
+        df['text'] = df['text'].fillna('')
+        return df
+
+    df1 = load_mypersonality_data()
+    df2 = load_essay_data()
+    
+    trainval1, test1_df = train_test_split(df1, test_size=0.1, random_state=42)
+    trainval2, test2_df = train_test_split(df2, test_size=0.1, random_state=42)
+    trainval_df = pd.concat([trainval1, trainval2], ignore_index=True)
+    return trainval1, test1_df, test2_df
+
+
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    f1 = f1_score(labels, preds, average='binary', zero_division=0)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "f1": f1}
+
+
+class ClassifierHead(LlamaPreTrainedModel):
+    def __init__(self, config, mlp_hidden_size=256, dropout_rate=0.3):
         super().__init__(config)
-        # Store the number of labels, which is part of the config object
         self.num_labels = config.num_labels
-        
-        # The main Llama model body
         self.model = LlamaModel(config)
-        
-        # Our custom 2-layer MLP classifier head
         self.classifier = nn.Sequential(
             nn.Linear(config.hidden_size, mlp_hidden_size),
             nn.ReLU(),
@@ -57,24 +84,9 @@ class LlamaForSequenceClassificationWithMLP(LlamaPreTrainedModel):
             nn.Linear(mlp_hidden_size, self.num_labels)
         )
 
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        labels=None,
-        **kwargs, # Accept and forward any other arguments the Trainer might pass
-    ):
-        # Pass inputs through the base Llama model
-        # The `output_hidden_states` argument is removed from here.
-        # It will be passed automatically by the Trainer via **kwargs
-        # when gradient_checkpointing is enabled.
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **kwargs,
-        )
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs,)
         
-        # Perform masked mean pooling to get a single sentence embedding
         hidden_states = outputs.last_hidden_state
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
         sum_embeddings = torch.sum(hidden_states * input_mask_expanded, 1)
@@ -97,114 +109,111 @@ class LlamaForSequenceClassificationWithMLP(LlamaPreTrainedModel):
         )
 
 
-## ---------------------------------------------------
-## --- Data Loading Function (no changes needed) ---
-## ---------------------------------------------------
-def load_and_prepare_data(file_path, text_col, target_col):
-    """Loads data from a CSV and prepares it for all experiments."""
-    print(f"\n--- Loading and preparing data for target: {target_col} ---")
-    df = pd.read_csv(file_path, encoding='Windows-1252')
-    df = df.dropna(subset=[text_col, target_col])
-    
-    if df[target_col].nunique() < 2:
-        print(f"Warning: Not enough class diversity for {target_col}. Skipping this trait.")
-        return None
-        
-    df['label'] = df[target_col].apply(lambda x: 1 if str(x).lower() == 'y' else 0)
-    df_processed = df[[text_col, 'label']].rename(columns={text_col: 'text'})
-    
-    train_df, _ = train_test_split(df_processed, test_size=0.1, random_state=42, stratify=df_processed['label'])
-    
-    train_val_dataset = Dataset.from_pandas(train_df)
-    
-    # Create a small validation set
-    train_val_split = train_val_dataset.train_test_split(test_size=0.1, seed=42)
-    
-    dataset_dict = DatasetDict({
-        'train': train_val_split['train'],
-        'validation': train_val_split['test']
-    })
-    
-    print("Data preparation complete.")
-    return dataset_dict
-
-## ---------------------------------------------------
-## --- Tokenizer (loaded once) ---
-## ---------------------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
+print(f"Using ModelL: {Config.MODEL_CHECKPOINT}")
 print("Loading tokenizer...")
-tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, token=my_token)
+tokenizer_llama = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
 if tokenizer_llama.pad_token is None:
     tokenizer_llama.pad_token = tokenizer_llama.eos_token
 
-## ---------------------------------------------------
-## --- Main Execution Loop for All Traits ---
-## ---------------------------------------------------
-for target_trait in ALL_TARGET_COLUMNS:
+lora_config = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    r=32,
+    lora_alpha=64,
+    lora_dropout=0.1, #0.1
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    # target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
+)
+training_args_template = TrainingArguments(
+    num_train_epochs=5,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    learning_rate=2e-4,
+    logging_steps=25,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+    metric_for_best_model="accuracy",
+    weight_decay=0.01,
+    lr_scheduler_type="cosine",
+    group_by_length=True,
+    # logging_dir=f"{BASE_OUTPUT_DIR}/logs",
+    # report_to="tensorboard",
+    save_total_limit=1, # Only save the best checkpoint
+)
+
+trainval_df, test1_df, test2_df = load_and_prepare_all_data()
+for target_trait in Config.ALL_TARGET_COLUMNS:
     print("\n" + "="*80)
     print(f" PROCESSING TRAIT: {target_trait} ".center(80, "="))
     print("="*80)
 
-    output_dir_trait = os.path.join(BASE_OUTPUT_DIR, f"{target_trait}")
-    main_dataset_dict = load_and_prepare_data(DATA_FILE, TEXT_COLUMN, target_trait)
-    if main_dataset_dict is None:
-        continue
+    print(f"\nBalancing training data for class labels in trait: {target_trait}")
+    train_df, val_df = train_test_split(trainval_df, test_size=0.1, random_state=42, stratify=trainval_df[target_trait])
+    X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
+    y_train = train_df[target_trait]
+    print(f"Original training distribution for {target_trait}: \n{y_train.value_counts(normalize=True)}")
+    
+    ros = RandomOverSampler(random_state=42) # Use RandomOverSampler to balance the TRAINING data
+    X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
+    train_df_balanced = pd.concat([X_train_resampled, y_train_resampled], axis=1)
+    print(f"Balanced training distribution for {target_trait}: \n{train_df_balanced[target_trait].value_counts(normalize=True)}")
+    
+    base_dataset_dict = DatasetDict({
+        'train': Dataset.from_pandas(train_df_balanced),
+        'validation': Dataset.from_pandas(val_df), # Validation set is NOT resampled
+        'test1': Dataset.from_pandas(test1_df),   # Test sets are NOT resampled
+        'test2': Dataset.from_pandas(test2_df)
+    })
+    # --- End of New Balancing Section ---
 
-    # Initialize the custom model using the robust inheritance method
-    print("\nInitializing custom LlamaForSequenceClassificationWithMLP model...")
-    model = LlamaForSequenceClassificationWithMLP.from_pretrained(
-        MODEL_CHECKPOINT,
+    print(f"\nTokenizing data...")
+    trait_dataset_dict = base_dataset_dict.rename_column(target_trait, "label")
+    def tokenize_function(examples):
+        return tokenizer_llama(examples["text"], truncation=True, max_length=128)
+    tokenized_dataset = trait_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
+
+    model_llama = ClassifierHead.from_pretrained(
+        Config.MODEL_CHECKPOINT,
         num_labels=2,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        token=my_token,
+        token=Config.get_hf_token,
     )
-    model.config.pad_token_id = tokenizer_llama.pad_token_id
+    model_llama.config.pad_token_id = tokenizer_llama.pad_token_id
+    model_llama_lora = get_peft_model(model_llama, lora_config)
+    model_llama_lora.print_trainable_parameters()
 
-    # Apply LoRA to the new model
-    print("Applying LoRA configuration...")
-    lora_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS,
-        r=4, #16
-        lora_alpha=8,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"] 
-    )
-    peft_model = get_peft_model(model, lora_config)
-    peft_model.print_trainable_parameters()
-    
-    # Tokenize the dataset
-    def tokenize_function(examples):
-        return tokenizer_llama(examples["text"], truncation=True, max_length=128) # Keep max_length small
-    tokenized_dataset = main_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
-    
-    print("Configuring Trainer...")
-    trainer = Trainer(
-        model=peft_model,
-        args=TrainingArguments(
-            output_dir=output_dir_trait,
-            num_train_epochs=3,
-            per_device_train_batch_size=2, # Use a small batch size
-            gradient_accumulation_steps=8, # Accumulate to get effective batch size of 16
-            gradient_checkpointing=True,   # Essential for saving memory
-            learning_rate=2e-4,
-            logging_steps=10,
-            save_strategy="epoch",
-            eval_strategy="epoch",
-            load_best_model_at_end=True,
-            bf16=torch.cuda.is_available() # Use bfloat16 for performance
-        ),
+    output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
+    os.makedirs(output_dir_trait, exist_ok=True)
+    training_args = training_args_template
+    training_args.output_dir = output_dir_trait 
+
+    trainer_llama = Trainer(
+        model=model_llama_lora,
+        args=training_args,
         train_dataset=tokenized_dataset["train"],
         eval_dataset=tokenized_dataset["validation"],
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
-        compute_metrics=lambda p: {"accuracy": accuracy_score(p.label_ids, np.argmax(p.predictions, axis=1))},
+        compute_metrics=compute_metrics,
     )
+    trainer_llama.train()
 
-    print(f"\nStarting fine-tuning for {target_trait} with robust inherited model...")
-    trainer.train()
-
-    print(f"Saving final model adapter and tokenizer to {output_dir_trait}")
-    peft_model.save_pretrained(output_dir_trait)
-    tokenizer_llama.save_pretrained(output_dir_trait)
+    for k,v in {'test1': "mypersonality", 'test2': "Essay"}.items():
+        print("\n" + "-"*50 , f"f or {target_trait}")
+        print(f"Evaluating on Test Set {v} for trait: {target_trait}")
+        test_results = trainer_llama.evaluate(eval_dataset=tokenized_dataset[k])
+        print(f"\n--- Test Set {v} Evaluation Results ---")
+        for key, value in test_results.items():
+            print(f" {key}: {value:.4f}")
+        print("\n" + "-"*50)
+    
+    del model_llama, model_llama_lora, trainer_llama
+    gc.collect()
+    torch.cuda.empty_cache()
 
 print("\n" + "="*80)
 print(" SCRIPT FINISHED: ALL TRAITS PROCESSED ".center(80, "="))
