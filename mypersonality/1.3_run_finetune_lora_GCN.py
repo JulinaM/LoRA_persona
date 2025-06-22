@@ -1,220 +1,364 @@
 import os
-import torch
-import torch.nn as nn
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, concatenate_datasets
 from transformers import (
     AutoTokenizer,
+    AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding,
+    EarlyStoppingCallback,
 )
-from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, LlamaModel
-from transformers.modeling_outputs import SequenceClassifierOutput
 from peft import get_peft_model, LoraConfig, TaskType
-
-# NEW IMPORTS for Graph Convolutional Network
-# You may need to install these: pip install torch_geometric torch_sparse torch_scatter
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.neighbors import kneighbors_graph
+import torch
+from torch.optim import AdamW
+from torch.nn import CrossEntropyLoss
+from imblearn.over_sampling import RandomOverSampler
+import gc
+import json
+import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-from torch.nn import functional as F
+from torch_geometric.data import Data
+from torch_geometric.utils import from_scipy_sparse_matrix
 
-## ---------------------------------------------------
-## --- Configuration ---
-## ---------------------------------------------------
-ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
-TEXT_COLUMN = "STATUS"
-DATA_FILE = "/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv"
-MODEL_CHECKPOINT_LLAMA = "meta-llama/Meta-Llama-3-8B"
-BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt_llama_gcn_lora" 
-my_token = "" # Your Hugging Face token
 
+class Config:
+    DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
+    DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
+    ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
+    MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
+    BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_gcn_class_balanced"
+    
+    # --- GCN Hyperparameters ---
+    GCN_HIDDEN_CHANNELS = 128
+    GCN_EPOCHS = 200
+    GCN_LR = 1e-3
+    GCN_WEIGHT_DECAY = 5e-4
+    GCN_EARLY_STOPPING_PATIENCE = 15
+    GRAPH_NEIGHBORS = 5 # Number of neighbors (k) for the kNN graph
+
+    def get_hf_token():
+        try:
+            with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
+                keys = json.load(f)
+                my_token = keys['hf_read']
+        except (FileNotFoundError, KeyError) as e:
+            print(f"Error reading token: {e}. Please ensure '../data/keys.json' exists and contains the 'hf_read' key.")
+            my_token = None 
+        return my_token
+
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    f1 = f1_score(labels, preds, average='binary', zero_division=0)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "f1": f1}
+
+def load_and_prepare_all_data():
+    print("--- Loading and Preparing All Datasets ---")
+    def load_mypersonality_data():
+        df = pd.read_csv(Config.DATA_URL_MYPERSONALITY, encoding='Windows-1252')
+        df = df.rename(columns={'STATUS': 'text'})
+        df['text'] = df['text'].fillna('')
+        df = df[['text'] + Config.ALL_TARGET_COLUMNS]
+        for col in Config.ALL_TARGET_COLUMNS:
+            df[col] = df[col].apply(lambda x: 1 if str(x).lower() == 'y' else 0)
+        return df
+
+    def load_essay_data():
+        df = pd.read_csv(Config.DATA_URL_ESSAY, encoding='utf-8')
+        df['text'] = df['text'].fillna('')
+        return df
+
+    df1 = load_mypersonality_data()
+    df2 = load_essay_data()
+    
+    trainval1, test1_df = train_test_split(df1, test_size=0.1, random_state=42)
+    trainval2, test2_df = train_test_split(df2, test_size=0.1, random_state=42)
+    trainval_df = pd.concat([trainval1, trainval2], ignore_index=True)
+    return trainval1, test1_df, test2_df
+
+
+# =====================================================================================
+# 2. GCN MODEL AND HELPER FUNCTIONS
+# =====================================================================================
+class GCNClassifier(torch.nn.Module):
+    """
+    Graph Convolutional Network for node classification.
+    It consists of two GCN layers.
+    """
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        # First GCN layer
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+        # Second GCN layer
+        x = self.conv2(x, edge_index)
+        # Output raw logits for CrossEntropyLoss
+        return x
+
+def build_graph(embeddings, k):
+    """
+    Constructs a k-NN graph from node embeddings.
+    """
+    print(f"Building k-NN graph with k={k}...")
+    # Using scikit-learn to build the adjacency matrix efficiently
+    adj_matrix = kneighbors_graph(embeddings, k, mode='connectivity', include_self=False)
+    # Convert the sparse adjacency matrix to PyTorch Geometric's edge_index format
+    edge_index = from_scipy_sparse_matrix(adj_matrix)[0]
+    return edge_index
+
+def get_embeddings(model, dataset, tokenizer, device):
+    """
+    Extracts mean-pooled embeddings from the last hidden state of the Llama model.
+    """
+    model.eval()
+    all_embeddings = []
+    
+    # Create a temporary trainer to use its dataloader
+    temp_trainer = Trainer(model=model, data_collator=DataCollatorWithPadding(tokenizer=tokenizer))
+    dataloader = temp_trainer.get_eval_dataloader(dataset)
+
+    with torch.no_grad():
+        for batch in dataloader:
+            # Move batch to the correct device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            # We need the hidden states, not the classification logits
+            outputs = model.base_model(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                output_hidden_states=True
+            )
+            # Get the last hidden state
+            last_hidden_state = outputs.hidden_states[-1]
+            # Mean pooling: average the embeddings across the sequence length
+            # We use the attention mask to ignore padding tokens
+            mask = batch['attention_mask'].unsqueeze(-1).expand(last_hidden_state.size()).float()
+            sum_embeddings = torch.sum(last_hidden_state * mask, 1)
+            sum_mask = torch.clamp(mask.sum(1), min=1e-9)
+            mean_pooled = sum_embeddings / sum_mask
+            all_embeddings.append(mean_pooled.cpu())
+
+    return torch.cat(all_embeddings, dim=0)
+
+# =====================================================================================
+# 3. MAIN SCRIPT LOGIC
+# =====================================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
+print(f"Using Model: {Config.MODEL_CHECKPOINT}")
 
-## ---------------------------------------------------
-## --- Custom GCN Model Definition (Inheritance) ---
-## ---------------------------------------------------
-class LlamaForGraphClassification(LlamaPreTrainedModel):
-    """
-    Custom model integrating a Llama backbone with a GCN classifier head.
-    This model expects not just text inputs but also graph structure data.
-    """
-    def __init__(self, config, gcn_hidden_channels=256, dropout_rate=0.3):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = LlamaModel(config) # The Llama backbone
-
-        # GCN Classifier Head
-        self.gcn_conv1 = GCNConv(config.hidden_size, gcn_hidden_channels)
-        self.gcn_conv2 = GCNConv(gcn_hidden_channels, self.num_labels)
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, node_features, edge_index):
-        """
-        The forward pass for the GCN head. It takes pre-computed node features.
-        """
-        x = self.gcn_conv1(node_features, edge_index)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.gcn_conv2(x, edge_index)
-        return x
-
-## ---------------------------------------------------
-## --- Custom Trainer for Graph Model ---
-## ---------------------------------------------------
-class GCNTrainer(Trainer):
-    """
-    Custom Trainer to handle the two-stage forward pass:
-    1. Get all node embeddings from the Llama model.
-    2. Pass the embeddings and graph structure through the GCN head.
-    """
-    # THE FIX: Added `num_items_in_batch=None` to match the parent Trainer's method signature.
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # The Trainer has already moved the 'inputs' dict to the correct device.
-        # Extract graph structure and labels.
-        edge_index = inputs.pop("edge_index")
-        graph_labels = inputs.pop("graph_labels")
-        
-        # 1. Get node embeddings from the Llama backbone (the 'model.model' part)
-        node_features_outputs = model.model.model(**inputs)
-        node_features = node_features_outputs.last_hidden_state
-        
-        # Perform masked mean pooling on the node features
-        attention_mask = inputs["attention_mask"]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(node_features.size()).float()
-        sum_embeddings = torch.sum(node_features * input_mask_expanded, 1)
-        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-        pooled_features = sum_embeddings / sum_mask
-
-        # 2. Pass embeddings and graph structure through the GCN head
-        logits = model(node_features=pooled_features, edge_index=edge_index)
-        
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(logits, graph_labels)
-        
-        return (loss, {"logits": logits}) if return_outputs else loss
-
-## ---------------------------------------------------
-## --- Data Loading Function (no changes) ---
-## ---------------------------------------------------
-def load_and_prepare_data(file_path, text_col, target_col):
-    print(f"\n--- Loading and preparing data for target: {target_col} ---")
-    df = pd.read_csv(file_path, encoding='Windows-1252')
-    df = df.dropna(subset=[text_col, target_col])
-    
-    if df[target_col].nunique() < 2:
-        print(f"Warning: Not enough class diversity for {target_col}. Skipping this trait.")
-        return None
-        
-    df['label'] = df[target_col].apply(lambda x: 1 if str(x).lower() == 'y' else 0)
-    df_processed = df[[text_col, 'label']].rename(columns={text_col: 'text'})
-    
-    # For GCN, we use the entire dataset as one graph
-    dataset = Dataset.from_pandas(df_processed)
-    print("Data preparation complete.")
-    return dataset
-
-## ---------------------------------------------------
-## --- Tokenizer (loaded once) ---
-## ---------------------------------------------------
 print("Loading tokenizer...")
-tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT_LLAMA, token=my_token)
+tokenizer_llama = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
 if tokenizer_llama.pad_token is None:
     tokenizer_llama.pad_token = tokenizer_llama.eos_token
 
-## ---------------------------------------------------
-## --- Main Execution Loop ---
-## ---------------------------------------------------
-for target_trait in ALL_TARGET_COLUMNS:
+lora_config = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.1,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+)
+
+training_args_template = TrainingArguments(
+    num_train_epochs=10,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    learning_rate=3e-5,
+    logging_steps=25,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
+    greater_is_better=True,
+    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+    weight_decay=0.01,
+    lr_scheduler_type="cosine",
+    group_by_length=True,
+    save_total_limit=1,
+)
+
+# Load the raw dataframes first
+trainval_df, test1_df, test2_df = load_and_prepare_all_data()
+# for target_trait in Config.ALL_TARGET_COLUMNS:
+for target_trait in ['cEXT', 'cOPN']:
+
     print("\n" + "="*80)
     print(f" PROCESSING TRAIT: {target_trait} ".center(80, "="))
     print("="*80)
 
-    output_dir_trait = os.path.join(BASE_OUTPUT_DIR, f"{target_trait}")
-    full_dataset = load_and_prepare_data(DATA_FILE, TEXT_COLUMN, target_trait)
-    if full_dataset is None:
-        continue
-
-    # --- Graph Construction ---
-    num_nodes = len(full_dataset)
-    # Create a fully connected graph (every node connected to every other node)
-    # Keep these tensors on the CPU. The Trainer will move them to the GPU.
-    edge_index = torch.combinations(torch.arange(num_nodes), r=2).t().contiguous()
-    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
-    graph_labels = torch.tensor(full_dataset['label'], dtype=torch.long)
-    print(f"Constructed graph with {num_nodes} nodes and {edge_index.shape[1]} edges.")
-
-    # --- Model Initialization ---
-    model = LlamaForGraphClassification.from_pretrained(
-        MODEL_CHECKPOINT_LLAMA,
-        num_labels=2,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        token=my_token,
-    )
-    model.config.pad_token_id = tokenizer_llama.pad_token_id
-
-    # Apply LoRA to the Llama backbone
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"]
-    )
-    peft_model = get_peft_model(model, lora_config)
-    peft_model.print_trainable_parameters()
-
-    # --- Tokenize all nodes ---
-    def tokenize_function(examples):
-        return tokenizer_llama(examples["text"], truncation=True, max_length=128, padding="max_length")
+    # --- Data Preparation ---
+    print(f"\nBalancing training data for class labels in trait: {target_trait}")
+    train_df, val_df = train_test_split(trainval_df, test_size=0.1, random_state=42, stratify=trainval_df[target_trait])
+    # X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
+    # y_train = train_df[target_trait]
     
-    # We tokenize the whole dataset but will only use it for passing to the model
-    tokenized_inputs = tokenize_function(full_dataset)
-    # The "dataset" for the trainer is just a dummy to control the number of steps
-    train_dataset = Dataset.from_dict({'dummy': range(len(full_dataset))})
+    # ros = RandomOverSampler(random_state=42)
+    # X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
+    # train_df_balanced = pd.concat([X_train_resampled, y_train_resampled], axis=1)
+    
+    base_dataset_dict = DatasetDict({
+        'train': Dataset.from_pandas(train_df),
+        'validation': Dataset.from_pandas(val_df),
+        'test1': Dataset.from_pandas(test1_df),
+        'test2': Dataset.from_pandas(test2_df)
+    })
+    
+    trait_dataset_dict = base_dataset_dict.rename_column(target_trait, "label")
+    def tokenize_function(examples):
+        return tokenizer_llama(examples["text"], truncation=True, max_length=128)
+    tokenized_dataset = trait_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
+    
+    # ---------------------------------------------------------------------------------
+    # STAGE 1: FINE-TUNE LLAMA-LORA TO GET GOOD EMBEDDINGS
+    # ---------------------------------------------------------------------------------
+    print("\n--- STAGE 1: Fine-tuning Llama-LoRA ---")
+    model_llama = AutoModelForSequenceClassification.from_pretrained(
+        Config.MODEL_CHECKPOINT,
+        num_labels=2,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto"
+    )
+    model_llama.config.pad_token_id = tokenizer_llama.pad_token_id
+    model_llama_lora = get_peft_model(model_llama, lora_config)
+    model_llama_lora.print_trainable_parameters()
 
+    output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait, "llama_ckpt")
+    os.makedirs(output_dir_trait, exist_ok=True)
+    training_args = training_args_template
+    training_args.output_dir = output_dir_trait 
 
-    # --- Custom Data Collator ---
-    # This collator adds the static graph data to every batch.
-    class GraphDataCollator:
-        def __call__(self, features):
-            # The 'features' are just dummy indices, we ignore them
-            # Instead, we return the pre-tokenized inputs for the whole graph
-            batch = {
-                'input_ids': torch.tensor(tokenized_inputs['input_ids']),
-                'attention_mask': torch.tensor(tokenized_inputs['attention_mask']),
-                'edge_index': edge_index,
-                'graph_labels': graph_labels
-            }
-            return batch
+    trainer_llama = Trainer(
+        model=model_llama_lora,
+        args=training_args,
+        train_dataset=tokenized_dataset["train"],
+        eval_dataset=tokenized_dataset["validation"],
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+    )
+    trainer_llama.train()
 
-    # --- Trainer Setup ---
-    trainer = GCNTrainer(
-        model=peft_model,
-        args=TrainingArguments(
-            output_dir=output_dir_trait,
-            num_train_epochs=10, # GCNs may benefit from more epochs
-            per_device_train_batch_size=1, # We process the whole graph, so batch size is 1
-            gradient_accumulation_steps=16,
-            gradient_checkpointing=True,
-            learning_rate=5e-5, # GCNs can be sensitive to learning rate
-            logging_steps=1,
-            save_strategy="epoch",
-            eval_strategy="no", # Evaluation would require a separate validation graph
-            remove_unused_columns=False,
-        ),
-        train_dataset=train_dataset,
-        data_collator=GraphDataCollator(),
+    # ---------------------------------------------------------------------------------
+    # STAGE 2: GCN CLASSIFICATION ON LLAMA EMBEDDINGS
+    # ---------------------------------------------------------------------------------
+    print("\n--- STAGE 2: GCN Training and Evaluation ---")
+    
+    # --- Step 2.1: Extract Embeddings from fine-tuned Llama ---
+    print("Extracting embeddings for all datasets...")
+    # The trainer loads the best model, which we will use
+    fine_tuned_model = trainer_llama.model
+    
+    # We create one large dataset to build the graph, then create masks
+    full_dataset_df = pd.concat([
+        train_df_balanced.assign(split='train'),
+        val_df.assign(split='validation'),
+        test1_df.assign(split='test1'),
+        test2_df.assign(split='test2')
+    ]).reset_index(drop=True)
+    
+    full_dataset_tokenized = Dataset.from_pandas(full_dataset_df).map(
+        tokenize_function, batched=True, remove_columns=list(full_dataset_df.columns)
     )
 
-    print(f"\nStarting GCN-based fine-tuning for {target_trait}...")
-    trainer.train()
+    all_embeddings = get_embeddings(fine_tuned_model, full_dataset_tokenized, tokenizer_llama, device)
+    labels = torch.tensor(full_dataset_df[target_trait].values, dtype=torch.long)
+    
+    # Create masks for train, validation, and test sets
+    train_mask = torch.tensor(full_dataset_df['split'] == 'train')
+    val_mask = torch.tensor(full_dataset_df['split'] == 'validation')
+    test1_mask = torch.tensor(full_dataset_df['split'] == 'test1')
+    test2_mask = torch.tensor(full_dataset_df['split'] == 'test2')
 
-    print(f"Saving final model adapter and tokenizer to {output_dir_trait}")
-    peft_model.save_pretrained(output_dir_trait)
-    tokenizer_llama.save_pretrained(output_dir_trait)
+    # --- Step 2.2: Build the Graph ---
+    # The graph structure is built using ALL embeddings to capture global relationships
+    edge_index = build_graph(all_embeddings.numpy(), k=Config.GRAPH_NEIGHBORS)
+    graph_data = Data(x=all_embeddings, edge_index=edge_index, y=labels)
+    graph_data = graph_data.to(device)
+
+    # --- Step 2.3: Train the GCN ---
+    print("Training GCN classifier...")
+    gcn_model = GCNClassifier(
+        in_channels=graph_data.num_features,
+        hidden_channels=Config.GCN_HIDDEN_CHANNELS,
+        out_channels=2 # Binary classification
+    ).to(device)
+
+    optimizer = AdamW(gcn_model.parameters(), lr=Config.GCN_LR, weight_decay=Config.GCN_WEIGHT_DECAY)
+    criterion = CrossEntropyLoss()
+
+    best_val_f1 = 0
+    patience_counter = 0
+
+    for epoch in range(Config.GCN_EPOCHS):
+        gcn_model.train()
+        optimizer.zero_grad()
+        out = gcn_model(graph_data.x, graph_data.edge_index)
+        loss = criterion(out[train_mask], graph_data.y[train_mask])
+        loss.backward()
+        optimizer.step()
+
+        # Validation
+        gcn_model.eval()
+        with torch.no_grad():
+            out = gcn_model(graph_data.x, graph_data.edge_index)
+            preds = out.argmax(dim=1)
+            
+            val_f1 = f1_score(graph_data.y[val_mask].cpu(), preds[val_mask].cpu())
+            
+            if (epoch + 1) % 10 == 0:
+                print(f'Epoch {epoch+1:03d}, Loss: {loss:.4f}, Val F1: {val_f1:.4f}')
+
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                patience_counter = 0
+                # Save the best model state
+                torch.save(gcn_model.state_dict(), os.path.join(Config.BASE_OUTPUT_DIR, target_trait, 'best_gcn_model.pt'))
+            else:
+                patience_counter += 1
+
+        if patience_counter >= Config.GCN_EARLY_STOPPING_PATIENCE:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+    
+    # --- Step 2.4: Evaluate the GCN ---
+    print("Evaluating GCN on test sets...")
+    # Load the best model for final evaluation
+    gcn_model.load_state_dict(torch.load(os.path.join(Config.BASE_OUTPUT_DIR, target_trait, 'best_gcn_model.pt')))
+    gcn_model.eval()
+
+    with torch.no_grad():
+        final_out = gcn_model(graph_data.x, graph_data.edge_index)
+        final_preds = final_out.argmax(dim=1)
+        
+        for split_name, mask in [('test1', test1_mask), ('test2', test2_mask)]:
+            test_labels = graph_data.y[mask].cpu().numpy()
+            test_preds = final_preds[mask].cpu().numpy()
+            
+            acc = accuracy_score(test_labels, test_preds)
+            f1 = f1_score(test_labels, test_preds, average='binary')
+            
+            print("\n" + "-"*50)
+            print(f"GCN Test Results on {split_name} for trait: {target_trait}")
+            print(f"  Accuracy: {acc:.4f}")
+            print(f"  F1 Score: {f1:.4f}")
+            print("-"*50)
+
+    # --- Cleanup ---
+    del model_llama, model_llama_lora, trainer_llama, gcn_model, graph_data
+    gc.collect()
+    torch.cuda.empty_cache()
 
 print("\n" + "="*80)
 print(" SCRIPT FINISHED: ALL TRAITS PROCESSED ".center(80, "="))

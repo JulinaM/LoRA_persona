@@ -89,24 +89,25 @@ lora_config = LoraConfig(
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     # target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
 )
-training_args_template = TrainingArguments(
+training_args_template = TrainingArguments (
     # logging_dir=f"{BASE_OUTPUT_DIR}/logs",
-    num_train_epochs=10,
+    num_train_epochs=5,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=8,
-    learning_rate=2e-4,
-    logging_steps=25,
+    learning_rate=3e-4,
+    # logging_steps=25,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
     bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-    metric_for_best_model="f1", #greater_is_better=True
+    metric_for_best_model="accuracy", 
+    greater_is_better=True,
     weight_decay=0.01,
     lr_scheduler_type="cosine",
     group_by_length=True,
     save_total_limit=1,
 )
-
+print(training_args_template)
 # Load the raw dataframes first
 trainval_df, test1_df, test2_df = load_and_prepare_all_data()
 for target_trait in Config.ALL_TARGET_COLUMNS:
@@ -116,17 +117,17 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
 
     print(f"\nBalancing training data for class labels in trait: {target_trait}")
     train_df, val_df = train_test_split(trainval_df, test_size=0.1, random_state=42, stratify=trainval_df[target_trait])
-    X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
-    y_train = train_df[target_trait]
-    print(f"Original training distribution for {target_trait}: \n{y_train.value_counts(normalize=True)}")
+    # X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
+    # y_train = train_df[target_trait]
+    # print(f"Original training distribution for {target_trait}: \n{y_train.value_counts(normalize=True)}")
     
-    ros = RandomOverSampler(random_state=42) # Use RandomOverSampler to balance the TRAINING data
-    X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
-    train_df_balanced = pd.concat([X_train_resampled, y_train_resampled], axis=1)
-    print(f"Balanced training distribution for {target_trait}: \n{train_df_balanced[target_trait].value_counts(normalize=True)}")
+    # ros = RandomOverSampler(random_state=42) # Use RandomOverSampler to balance the TRAINING data
+    # X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
+    # train_df_balanced = pd.concat([X_train_resampled, y_train_resampled], axis=1)
+    # print(f"Balanced training distribution for {target_trait}: \n{train_df_balanced[target_trait].value_counts(normalize=True)}")
     
     base_dataset_dict = DatasetDict({
-        'train': Dataset.from_pandas(train_df_balanced),
+        'train': Dataset.from_pandas(train_df),
         'validation': Dataset.from_pandas(val_df), # Validation set is NOT resampled
         'test1': Dataset.from_pandas(test1_df),   # Test sets are NOT resampled
         'test2': Dataset.from_pandas(test2_df)
@@ -136,7 +137,7 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
     print(f"\nTokenizing data...")
     trait_dataset_dict = base_dataset_dict.rename_column(target_trait, "label")
     def tokenize_function(examples):
-        return tokenizer_llama(examples["text"], truncation=True, max_length=128)
+        return tokenizer_llama(examples["text"], truncation=True, max_length=256)
     tokenized_dataset = trait_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
 
     model_llama = AutoModelForSequenceClassification.from_pretrained(
@@ -149,10 +150,10 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
     model_llama_lora = get_peft_model(model_llama, lora_config)
     model_llama_lora.print_trainable_parameters()
 
-    output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
-    os.makedirs(output_dir_trait, exist_ok=True)
+    # output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
+    # os.makedirs(output_dir_trait, exist_ok=True)
     training_args = training_args_template
-    training_args.output_dir = output_dir_trait 
+    # training_args.output_dir = output_dir_trait 
 
     trainer_llama = Trainer(
         model=model_llama_lora,
@@ -162,7 +163,6 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
-
     )
     trainer_llama.train()
 
