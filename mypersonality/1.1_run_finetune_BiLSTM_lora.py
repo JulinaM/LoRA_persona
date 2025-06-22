@@ -10,67 +10,14 @@ from transformers import (
 from peft import get_peft_model, LoraConfig, TaskType
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
 import torch
 import torch.nn as nn
 from imblearn.over_sampling import RandomOverSampler
 import gc
-import json 
 from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, LlamaModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 
-
-class Config:
-    DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
-    DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
-    ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
-    MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
-    # MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
-    # MODEL_CHECKPOINT = "tiiuae/falcon-7b"
-    BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_lora_class_balanced" 
-    def get_hf_token():
-        try:
-            with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
-                keys = json.load(f)
-                my_token = keys['hf_read']
-        except (FileNotFoundError, KeyError) as e:
-            print(f"Error reading token: {e}. Please ensure '../data/keys.json' exists and contains the 'hf_read' key.")
-            my_token = None 
-        return my_token
-
-
-def load_and_prepare_all_data():
-    print("--- Loading and Preparing All Datasets ---")
-    def load_mypersonality_data():
-        df = pd.read_csv(Config.DATA_URL_MYPERSONALITY, encoding='Windows-1252')
-        df = df.rename(columns={'STATUS': 'text'})
-        df['text'] = df['text'].fillna('')
-        df = df[['text'] + Config.ALL_TARGET_COLUMNS]
-        for col in Config.ALL_TARGET_COLUMNS:
-            df[col] = df[col].apply(lambda x: 1 if str(x).lower() == 'y' else 0)
-        return df
-
-    def load_essay_data():
-        df = pd.read_csv(Config.DATA_URL_ESSAY, encoding='utf-8')
-        df['text'] = df['text'].fillna('')
-        return df
-
-    df1 = load_mypersonality_data()
-    df2 = load_essay_data()
-    
-    trainval1, test1_df = train_test_split(df1, test_size=0.1, random_state=42)
-    trainval2, test2_df = train_test_split(df2, test_size=0.1, random_state=42)
-    trainval_df = pd.concat([trainval1, trainval2], ignore_index=True)
-    return trainval1, test1_df, test2_df
-
-
-def compute_metrics(p):
-    preds = np.argmax(p.predictions, axis=1)
-    labels = p.label_ids
-    f1 = f1_score(labels, preds, average='binary', zero_division=0)
-    acc = accuracy_score(labels, preds)
-    return {"accuracy": acc, "f1": f1}
-
+from lora_utils import Config, LoRA_config, load_and_prepare_all_data, compute_metrics, create_out_dir
 
 class ClassifierHead(LlamaPreTrainedModel):
     def __init__(self, config, mlp_hidden_size=256, dropout_rate=0.3):
@@ -108,7 +55,6 @@ class ClassifierHead(LlamaPreTrainedModel):
             attentions=outputs.attentions,
         )
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 print(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
@@ -118,33 +64,6 @@ tokenizer_llama = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=C
 if tokenizer_llama.pad_token is None:
     tokenizer_llama.pad_token = tokenizer_llama.eos_token
 
-lora_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,
-    r=32,
-    lora_alpha=64,
-    lora_dropout=0.1, #0.1
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    # target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
-)
-training_args_template = TrainingArguments(
-    num_train_epochs=5,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=8,
-    learning_rate=2e-4,
-    logging_steps=25,
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    load_best_model_at_end=True,
-    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-    metric_for_best_model="accuracy",
-    weight_decay=0.01,
-    lr_scheduler_type="cosine",
-    group_by_length=True,
-    # logging_dir=f"{BASE_OUTPUT_DIR}/logs",
-    # report_to="tensorboard",
-    save_total_limit=1, # Only save the best checkpoint
-)
-
 trainval_df, test1_df, test2_df = load_and_prepare_all_data()
 for target_trait in Config.ALL_TARGET_COLUMNS:
     print("\n" + "="*80)
@@ -153,17 +72,17 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
 
     print(f"\nBalancing training data for class labels in trait: {target_trait}")
     train_df, val_df = train_test_split(trainval_df, test_size=0.1, random_state=42, stratify=trainval_df[target_trait])
-    X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
-    y_train = train_df[target_trait]
-    print(f"Original training distribution for {target_trait}: \n{y_train.value_counts(normalize=True)}")
+    # X_train = train_df.drop(columns=Config.ALL_TARGET_COLUMNS)
+    # y_train = train_df[target_trait]
+    # print(f"Original training distribution for {target_trait}: \n{y_train.value_counts(normalize=True)}")
     
-    ros = RandomOverSampler(random_state=42) # Use RandomOverSampler to balance the TRAINING data
-    X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
-    train_df_balanced = pd.concat([X_train_resampled, y_train_resampled], axis=1)
-    print(f"Balanced training distribution for {target_trait}: \n{train_df_balanced[target_trait].value_counts(normalize=True)}")
+    # ros = RandomOverSampler(random_state=42) # Use RandomOverSampler to balance the TRAINING data
+    # X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
+    # train_df_balanced = pd.concat([X_train_resampled, y_train_resampled], axis=1)
+    # print(f"Balanced training distribution for {target_trait}: \n{train_df_balanced[target_trait].value_counts(normalize=True)}")
     
     base_dataset_dict = DatasetDict({
-        'train': Dataset.from_pandas(train_df_balanced),
+        'train': Dataset.from_pandas(train_df),
         'validation': Dataset.from_pandas(val_df), # Validation set is NOT resampled
         'test1': Dataset.from_pandas(test1_df),   # Test sets are NOT resampled
         'test2': Dataset.from_pandas(test2_df)
@@ -173,7 +92,7 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
     print(f"\nTokenizing data...")
     trait_dataset_dict = base_dataset_dict.rename_column(target_trait, "label")
     def tokenize_function(examples):
-        return tokenizer_llama(examples["text"], truncation=True, max_length=128)
+        return tokenizer_llama(examples["text"], truncation=True, max_length=Config.TOKEN_MAX_LEN)
     tokenized_dataset = trait_dataset_dict.map(tokenize_function, batched=True, remove_columns=["text"])
 
     model_llama = ClassifierHead.from_pretrained(
@@ -184,13 +103,11 @@ for target_trait in Config.ALL_TARGET_COLUMNS:
         token=Config.get_hf_token,
     )
     model_llama.config.pad_token_id = tokenizer_llama.pad_token_id
-    model_llama_lora = get_peft_model(model_llama, lora_config)
+    model_llama_lora = get_peft_model(model_llama, LoRA_config.lora_config)
     model_llama_lora.print_trainable_parameters()
 
-    output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
-    os.makedirs(output_dir_trait, exist_ok=True)
-    training_args = training_args_template
-    training_args.output_dir = output_dir_trait 
+    training_args = LoRA_config.training_args_template
+    training_args.output_dir = create_out_dir(target_trait)
 
     trainer_llama = Trainer(
         model=model_llama_lora,
