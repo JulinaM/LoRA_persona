@@ -1,11 +1,10 @@
 import json, os, torch
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from sklearn.model_selection import train_test_split
 from peft import  LoraConfig, TaskType
 import pandas as pd
 import numpy as np
 from transformers import TrainingArguments
-
 
 class Config:
     DATA_URL_MYPERSONALITY = '/users/PGS0218/julina/projects/LoRA_persona/data/mypersonality.csv'
@@ -14,8 +13,11 @@ class Config:
     MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
     # MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
     # MODEL_CHECKPOINT = "tiiuae/falcon-7b"
-    BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/llama_lora_class_balanced" 
+    BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/" 
     TOKEN_MAX_LEN = 128
+    MODEL_CHECKPOINT_ROBERTA = "bert-base-uncased"
+    TEXT_COLUMN = "STATUS"
+
     def get_hf_token():
         try:
             with open('/users/PGS0218/julina/projects/LoRA_persona/data/keys.json', 'r') as f:
@@ -40,22 +42,24 @@ class LoRA_config:
         num_train_epochs=5,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        learning_rate=3e-4,
-        # logging_steps=25,
+        learning_rate=2e-5,
+        logging_strategy = "epoch",  #logging_steps=25,
+        warmup_steps=200, 
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        metric_for_best_model="accuracy", 
+        metric_for_best_model="f1", 
         greater_is_better=True,
-        weight_decay=0.01,
-        lr_scheduler_type="cosine",
+        weight_decay=0.05,
+        max_grad_norm=1.0,
+        lr_scheduler_type="linear",
         group_by_length=True,
         save_total_limit=1,
     )
 
 
-def load_and_prepare_all_data():
+def load_and_prepare_all_data(split_ratio=0.1):
     print("--- Loading and Preparing All Datasets ---")
     def load_mypersonality_data():
         df = pd.read_csv(Config.DATA_URL_MYPERSONALITY, encoding='Windows-1252')
@@ -74,8 +78,8 @@ def load_and_prepare_all_data():
     df1 = load_mypersonality_data()
     df2 = load_essay_data()
     
-    trainval1, test1_df = train_test_split(df1, test_size=0.1, random_state=42)
-    trainval2, test2_df = train_test_split(df2, test_size=0.1, random_state=42)
+    trainval1, test1_df = train_test_split(df1, test_size=split_ratio, random_state=42)
+    trainval2, test2_df = train_test_split(df2, test_size=split_ratio, random_state=42)
     trainval_df = pd.concat([trainval1, trainval2], ignore_index=True)
     return trainval1, test1_df, test2_df
 
@@ -86,6 +90,25 @@ def compute_metrics(p):
     f1 = f1_score(labels, preds, average='binary', zero_division=0)
     acc = accuracy_score(labels, preds)
     return {"accuracy": acc, "f1": f1}
+
+def compute_mtl_metrics(p):
+    """Computes overall micro-F1 and ROC-AUC for multi-label evaluation."""
+    logits = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+    labels = p.label_ids
+    sigmoid = torch.nn.Sigmoid()
+    probs = sigmoid(torch.Tensor(logits))
+    predictions = np.zeros(probs.shape)
+    predictions[np.where(probs >= 0.5)] = 1
+
+    f1_micro = f1_score(labels, predictions, average='micro')
+    roc_auc = roc_auc_score(labels, probs, average='micro')
+    accuracy = accuracy_score(labels, predictions)
+    metrics = {
+        'f1_micro': f1_micro,
+        'roc_auc_micro': roc_auc,
+        'accuracy': accuracy
+    }
+    return metrics
 
 def create_out_dir(target_trait):
     output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
