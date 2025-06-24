@@ -38,16 +38,16 @@ class LoRA_Config:
         num_train_epochs=5,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        learning_rate=2e-5,
+        learning_rate=2e-4,
         logging_strategy="epoch",
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1_micro",
         greater_is_better=True,
-        weight_decay=0.05,
-        lr_scheduler_type="linear",
-        warmup_steps=200,
+        weight_decay=0.01,
+        lr_scheduler_type="cosine",
+        # warmup_steps=200,
         max_grad_norm=1.0,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         save_total_limit=1,
@@ -168,16 +168,16 @@ def main():
     # --- STAGE 2: GCN Classification on MTL Embeddings ---
     print("\n--- STAGE 2: GCN Training and Evaluation for MTL ---")
     fine_tuned_model = trainer_llama.model
-    
     full_graph_df = pd.concat([
         train_df.assign(split='train'),
         val_df.assign(split='validation'),
         test1_df.assign(split='test1')
     ]).reset_index(drop=True)
     
+    full_graph_df['labels'] = full_graph_df[Config.ALL_TARGET_COLUMNS].values.tolist()
     full_graph_dataset = Dataset.from_pandas(full_graph_df)
-    full_graph_tokenized = full_graph_dataset.map(tokenize_function, batched=True, remove_columns=list(full_graph_df.columns))
-
+    full_graph_tokenized = full_graph_dataset.map(lambda e: tokenizer_llama(e['text'], truncation=True, max_length=128), batched=True, remove_columns=list(full_graph_df.columns))
+  
     all_embeddings = get_embeddings(fine_tuned_model, full_graph_tokenized, tokenizer_llama, device)
     labels = torch.tensor(full_graph_df['labels'].tolist(), dtype=torch.float)
     
