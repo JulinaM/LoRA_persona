@@ -22,7 +22,7 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.data import Data
 from torch_geometric.utils import from_scipy_sparse_matrix
 sys.path.insert(0,'/users/PGS0218/julina/projects/LoRA_persona')
-from utils.lora_utils import Config, LoRA_config, load_and_prepare_all_data, compute_mtl_metrics, create_out_dir
+from utils.lora_utils import Config, load_and_prepare_all_data, compute_mtl_metrics
 
 
 class LoRA_Config:
@@ -33,7 +33,7 @@ class LoRA_Config:
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
 
-    training_args_template = TrainingArguments(
+    training_args = TrainingArguments(
         output_dir=Config.BASE_OUTPUT_DIR,
         num_train_epochs=5,
         per_device_train_batch_size=4,
@@ -52,7 +52,6 @@ class LoRA_Config:
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         save_total_limit=1,
         disable_tqdm=False,
-        # MODIFIED: Explicitly tell the Trainer where to find the labels.
         label_names=["labels"],
     )
 
@@ -118,6 +117,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Using Model: {Config.MODEL_CHECKPOINT}")
+    print('Using args', LoRA_Config.training_args)
+
 
     tokenizer_llama = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
     if tokenizer_llama.pad_token is None:
@@ -153,25 +154,9 @@ def main():
     model_llama_lora = get_peft_model(model_llama, LoRA_Config.lora_config)
     model_llama_lora.print_trainable_parameters()
 
-    training_args = TrainingArguments(
-        output_dir=Config.BASE_OUTPUT_DIR,
-        num_train_epochs=5,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=8,
-        learning_rate=2e-5,
-        logging_strategy="epoch",
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="f1_micro",
-        weight_decay=0.01,
-        lr_scheduler_type="cosine",
-        group_by_length=True,
-        save_total_limit=1,
-    )
     trainer_llama = Trainer(
         model=model_llama_lora,
-        args=training_args,
+        args=LoRA_Config.training_args,
         train_dataset=tokenized_dataset["train"],
         eval_dataset=tokenized_dataset["validation"],
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
