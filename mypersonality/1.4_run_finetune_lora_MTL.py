@@ -23,35 +23,37 @@ class LoRA_config:
         lora_alpha=64,
         lora_dropout=0.1,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        # target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
         bias="none",
         task_type="SEQ_CLS"
     )
     
     training_args = TrainingArguments(
-        output_dir=Config.BASE_OUTPUT_DIR,
+        output_dir=Config.BASE_OUTPUT_DIR+'/llama_lora_mtl/',
         num_train_epochs=5,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        learning_rate=2e-5,
+        learning_rate=1e-4,
         logging_strategy="epoch", #logging_steps=25,
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1_micro",
-        weight_decay=0.05,
+        weight_decay=0.01,
         lr_scheduler_type="cosine",
         group_by_length=True,
         save_total_limit=1,
     )
 
 def main():
+    MODEL_CHECKPOINT = Config.MODEL_CHECKPOINT
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"Using Model: {Config.MODEL_CHECKPOINT}")
+    print(f"Using Model: {MODEL_CHECKPOINT}")
     print('Using args', LoRA_config.training_args)
 
     print("Loading tokenizer...")
-    tokenizer_llama = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
+    tokenizer_llama = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, token=Config.get_hf_token())
     if tokenizer_llama.pad_token is None:
         tokenizer_llama.pad_token = tokenizer_llama.eos_token if tokenizer_llama.pad_token is None else tokenizer_llama.pad_token
 
@@ -74,7 +76,7 @@ def main():
     tokenized_dataset = raw_dataset.map(preprocess_function, batched=True, remove_columns=["text"] + Config.ALL_TARGET_COLUMNS)
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        Config.MODEL_CHECKPOINT,
+        MODEL_CHECKPOINT,
         num_labels=len(Config.ALL_TARGET_COLUMNS),
         problem_type="multi_label_classification",
         torch_dtype=torch.bfloat16,
