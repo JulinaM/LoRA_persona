@@ -21,8 +21,8 @@ from utils.lora_utils import Config, load_and_prepare_all_data, compute_mtl_metr
 
 class ModelConfig:
     # LoRA Config
-    LORA_R = 32
-    LORA_ALPHA = 64
+    LORA_R = 64
+    LORA_ALPHA = 128
     LORA_DROPOUT = 0.1
     
     # MLP Config
@@ -32,9 +32,9 @@ class ModelConfig:
     EPOCHS = 10
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
-    LR = 2e-4 # A conservative learning rate for end-to-end training
+    LR = 0.00005 # A conservative learning rate for end-to-end training
     WEIGHT_DECAY = 0.01
-    EARLY_STOPPING_PATIENCE = 3
+    EARLY_STOPPING_PATIENCE = 2
 
 
 class LlamaMLPModel(torch.nn.Module):
@@ -84,6 +84,7 @@ class LlamaMLPModel(torch.nn.Module):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Using config: {ModelConfig.LR}")
 
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
     if tokenizer.pad_token is None:
@@ -152,6 +153,7 @@ def main():
         # Validation loop
         model.eval()
         all_val_preds, all_val_labels = [], []
+        v_total_loss = 0
         with torch.no_grad():
             for batch in val_loader:
                 labels = batch.pop("labels").to(device)
@@ -163,12 +165,16 @@ def main():
                 preds = (torch.sigmoid(outputs) > 0.5).int()
                 all_val_preds.append(preds.cpu())
                 all_val_labels.append(labels.cpu())
+
+                v_loss = criterion(outputs, labels)
+                v_loss = v_loss / ModelConfig.GRAD_ACCUM_STEPS 
+                v_total_loss += v_loss.item()
         
         val_preds = torch.cat(all_val_preds).numpy()
         val_labels = torch.cat(all_val_labels).numpy()
         val_f1 = f1_score(val_labels, val_preds, average='micro')
 
-        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {total_loss / len(train_loader):.4f}, Val F1: {val_f1:.4f}")
+        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {total_loss / len(train_loader):.4f}, Val Loss: {v_total_loss / len(val_loader):.4f}, Val F1: {val_f1:.4f}")
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
