@@ -33,7 +33,7 @@ class LoRA_config:
         num_train_epochs=5,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        learning_rate=1e-4,
+        learning_rate=2e-4,
         logging_strategy="epoch", #logging_steps=25,
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -44,6 +44,19 @@ class LoRA_config:
         group_by_length=True,
         save_total_limit=1,
     )
+
+class WeightedLossTrainer(Trainer):
+    def __init__(self, *args, pos_weight=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pos_weight = pos_weight
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        loss = loss_fct(logits, labels)
+        return (loss, outputs) if return_outputs else loss
 
 def main():
     MODEL_CHECKPOINT = Config.MODEL_CHECKPOINT
@@ -60,6 +73,14 @@ def main():
     trainval_df, test1_df, test2_df = load_and_prepare_all_data(0.15)
     train_df, val_df = train_test_split(trainval_df, test_size=0.15, random_state=42)
     print(f"\nData split into {len(train_df)} train, {len(val_df)} validation, {len(test1_df)} test1, and {len(test2_df)} test2 samples.")
+
+    labels_df = train_df[Config.ALL_TARGET_COLUMNS]
+    pos_counts = labels_df.sum()
+    neg_counts = len(labels_df) - pos_counts
+    pos_weight = neg_counts / (pos_counts + 1e-8)
+    pos_weight_tensor = torch.tensor(pos_weight.values, dtype=torch.float).to(device)
+    print("\nCalculated positive class weights for weighted loss:")
+    print(pos_weight)
 
     raw_dataset = DatasetDict({
         'train': Dataset.from_pandas(train_df),
@@ -86,7 +107,7 @@ def main():
     model_lora = get_peft_model(model, LoRA_config.lora_config)
     model_lora.print_trainable_parameters()
 
-    trainer = Trainer(
+    trainer = WeightedLossTrainer(
         model=model_lora,
         args=LoRA_config.training_args,
         train_dataset=tokenized_dataset["train"],
@@ -94,6 +115,7 @@ def main():
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
         compute_metrics=compute_mtl_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+        pos_weight = pos_weight_tensor
     )
 
     print("\n--- Starting Multi-Task Learning Training ---")
