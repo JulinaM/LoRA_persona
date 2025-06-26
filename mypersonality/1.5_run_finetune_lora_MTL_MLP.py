@@ -27,19 +27,22 @@ class ModelConfig:
     
     # MLP Config
     HIDDEN_DIM = 512
+    DROP_OUT = 0.5
     
     # Training Config
     EPOCHS = 10
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
-    LR = 0.00005 # A conservative learning rate for end-to-end training
+    LR = 0.00001 # A conservative learning rate for end-to-end training
     WEIGHT_DECAY = 0.01
-    EARLY_STOPPING_PATIENCE = 2
+    EARLY_STOPPING_PATIENCE = 3
+    TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
+    BASE_OUTPUT_DIR = Config.BASE_OUTPUT_DIR +'/LLAMA_LoRA_MTL_MLP/'
 
 
 class LlamaMLPModel(torch.nn.Module):
 
-    def __init__(self, model_checkpoint, num_labels, hidden_dim):
+    def __init__(self, model_checkpoint, num_labels, hidden_dim, drop_out=0.5):
         super().__init__()
         self.llama_base = AutoModel.from_pretrained(
             model_checkpoint,
@@ -60,9 +63,13 @@ class LlamaMLPModel(torch.nn.Module):
         self.mlp_head = torch.nn.Sequential(
             torch.nn.Linear(self.llama_peft.config.hidden_size, hidden_dim),
             torch.nn.ReLU(),
-            torch.nn.Dropout(0.5),
+            torch.nn.Dropout(drop_out),
+            # torch.nn.Linear(hidden_dim, hidden_dim),
+            # torch.nn.ReLU(),
+            # torch.nn.Dropout(drop_out),
             torch.nn.Linear(hidden_dim, num_labels)
         )
+        print("This is single layer MLP")
 
     def forward(self, input_ids, attention_mask):
         outputs = self.llama_peft(
@@ -90,8 +97,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    trainval_df, test1_df, test2_df = load_and_prepare_all_data(0.15)
-    train_df, val_df = train_test_split(trainval_df, test_size=0.15, random_state=42)
+    train_df, val_df, test1_df, test2_df = load_and_prepare_all_data(0.1)
     print(f"\nData split into {len(train_df)} train, {len(val_df)} validation, and test sets.")
     
     labels_df = train_df[Config.ALL_TARGET_COLUMNS]
@@ -103,7 +109,7 @@ def main():
     print(pos_weight)
 
     def preprocess_function(examples):
-        tokenized_inputs = tokenizer(examples['text'], truncation=True, max_length=Config.TOKEN_MAX_LEN)
+        tokenized_inputs = tokenizer(examples['text'], truncation=True, max_length=ModelConfig.TOKEN_MAX_LEN)
         labels = np.array([examples[col] for col in Config.ALL_TARGET_COLUMNS])
         tokenized_inputs['labels'] = labels.T.astype(np.float32)
         return tokenized_inputs
@@ -122,7 +128,8 @@ def main():
     model = LlamaMLPModel(
         model_checkpoint=Config.MODEL_CHECKPOINT,
         num_labels=len(Config.ALL_TARGET_COLUMNS),
-        hidden_dim=ModelConfig.HIDDEN_DIM
+        hidden_dim=ModelConfig.HIDDEN_DIM,
+        drop_out=ModelConfig.DROP_OUT
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=ModelConfig.LR, weight_decay=ModelConfig.WEIGHT_DECAY)
@@ -179,8 +186,8 @@ def main():
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             patience_counter = 0
-            os.makedirs(Config.BASE_OUTPUT_DIR, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(Config.BASE_OUTPUT_DIR, 'best_e2e_model.pt'))
+            os.makedirs(ModelConfig.BASE_OUTPUT_DIR, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt'))
             print(f"New best model saved with Val F1: {best_val_f1:.4f}")
         else:
             patience_counter += 1
@@ -191,7 +198,7 @@ def main():
 
     # Final Evaluation
     print("\n--- Evaluating best model on test sets ---")
-    model.load_state_dict(torch.load(os.path.join(Config.BASE_OUTPUT_DIR, 'best_e2e_model.pt')))
+    model.load_state_dict(torch.load(os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt')))
     model.eval()
 
     test_loaders = {
