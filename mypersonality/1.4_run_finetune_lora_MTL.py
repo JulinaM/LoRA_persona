@@ -44,6 +44,7 @@ class LoRA_config:
         group_by_length=True,
         save_total_limit=1,
     )
+    MAX_LEN = Config.TOKEN_MAX_LEN
 
 class WeightedLossTrainer(Trainer):
     def __init__(self, *args, pos_weight=None, **kwargs):
@@ -70,8 +71,7 @@ def main():
     if tokenizer_llama.pad_token is None:
         tokenizer_llama.pad_token = tokenizer_llama.eos_token if tokenizer_llama.pad_token is None else tokenizer_llama.pad_token
 
-    trainval_df, test1_df, test2_df = load_and_prepare_all_data(0.15)
-    train_df, val_df = train_test_split(trainval_df, test_size=0.15, random_state=42)
+    train_df, val_df, test1_df, test2_df = load_and_prepare_all_data(0.15)
     print(f"\nData split into {len(train_df)} train, {len(val_df)} validation, {len(test1_df)} test1, and {len(test2_df)} test2 samples.")
 
     labels_df = train_df[Config.ALL_TARGET_COLUMNS]
@@ -90,7 +90,7 @@ def main():
     })
 
     def preprocess_function(examples):
-        tokenized_inputs = tokenizer_llama(examples['text'], truncation=True, max_length=128)
+        tokenized_inputs = tokenizer_llama(examples['text'], truncation=True, max_length=LoRA_config.MAX_LEN)
         labels = np.array([examples[col] for col in Config.ALL_TARGET_COLUMNS])
         tokenized_inputs['labels'] = labels.T.astype(np.float32).tolist()
         return tokenized_inputs

@@ -11,8 +11,8 @@ class Config:
     DATA_URL_ESSAY = '/users/PGS0218/julina/projects/LoRA_persona/data/essay.csv'
     ALL_TARGET_COLUMNS = ['cEXT', 'cNEU', 'cAGR', 'cCON', 'cOPN']
     MODEL_CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
-    # MODEL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
-    # MODEL_CHECKPOINT = "tiiuae/falcon-7b"
+    MISTRAL_CHECKPOINT = "mistralai/Mistral-7B-v0.1"
+    FALCON_CHECKPOINT = "tiiuae/falcon-7b"
     BASE_OUTPUT_DIR = "/users/PGS0218/julina/projects/LoRA_persona/mypersonality/ckpt/" 
     TOKEN_MAX_LEN = 128
     MODEL_CHECKPOINT_ROBERTA = "bert-base-uncased"
@@ -59,7 +59,7 @@ class LoRA_config:
     )
 
 
-def load_and_prepare_all_data(split_ratio=0.1):
+def load_and_prepare_all_data(split_ratio=0.1, both=False):
     print("--- Loading and Preparing All Datasets ---")
     def load_mypersonality_data():
         df = pd.read_csv(Config.DATA_URL_MYPERSONALITY, encoding='Windows-1252')
@@ -78,10 +78,19 @@ def load_and_prepare_all_data(split_ratio=0.1):
     df1 = load_mypersonality_data()
     df2 = load_essay_data()
     
-    trainval1, test1_df = train_test_split(df1, test_size=split_ratio, random_state=42)
-    trainval2, test2_df = train_test_split(df2, test_size=split_ratio, random_state=42)
-    trainval_df = pd.concat([trainval1, trainval2], ignore_index=True)
-    return trainval1, test1_df, test2_df
+    train1, test1_df = train_test_split(df1, test_size=split_ratio*2, random_state=42)
+    val1, test1_df = train_test_split(test1_df, test_size=0.5, random_state=42)
+
+    train2, test2_df = train_test_split(df2, test_size=split_ratio*2, random_state=42)
+    val2, test2_df = train_test_split(test2_df, test_size=0.5, random_state=42)
+
+    if both:
+        print("Merging fb and essay dataset:")
+        train = pd.concat([train1, train2], ignore_index=True)
+        val = pd.concat([val1, val2], ignore_index=True)
+        return train, val, test1_df, test2_df
+    
+    return train1, val1, test1_df, test2_df
 
 
 def compute_metrics(p):
