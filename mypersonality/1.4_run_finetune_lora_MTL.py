@@ -33,7 +33,7 @@ class LoRA_config:
         num_train_epochs=5,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        learning_rate=2e-4,
+        learning_rate=1e-4,
         logging_strategy="epoch", #logging_steps=25,
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -45,6 +45,7 @@ class LoRA_config:
         save_total_limit=1,
     )
     MAX_LEN = Config.TOKEN_MAX_LEN
+    patience= 2
 
 class WeightedLossTrainer(Trainer):
     def __init__(self, *args, pos_weight=None, **kwargs):
@@ -71,7 +72,7 @@ def main():
     if tokenizer_llama.pad_token is None:
         tokenizer_llama.pad_token = tokenizer_llama.eos_token if tokenizer_llama.pad_token is None else tokenizer_llama.pad_token
 
-    train_df, val_df, test1_df, test2_df = load_and_prepare_all_data(0.15)
+    train_df, val_df, test1_df, test2_df = load_and_prepare_all_data(0.1)
     print(f"\nData split into {len(train_df)} train, {len(val_df)} validation, {len(test1_df)} test1, and {len(test2_df)} test2 samples.")
 
     labels_df = train_df[Config.ALL_TARGET_COLUMNS]
@@ -114,7 +115,7 @@ def main():
         eval_dataset=tokenized_dataset["validation"],
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer_llama),
         compute_metrics=compute_mtl_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=LoRA_config.patience)],
         pos_weight = pos_weight_tensor
     )
 
@@ -157,7 +158,7 @@ def main():
     print("\n SCRIPT FINISHED ".center(80, "="))
     del model, model_lora, trainer
     gc.collect()
-torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
