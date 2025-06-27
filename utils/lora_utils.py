@@ -130,8 +130,8 @@ def compute_mtl_metrics(p):
     }
     return metrics
 
-def create_unique_dir(base_dir):
+def create_unique_dir(task_name):
     from datetime import datetime
-    output_dir = os.path.join(base_dir, datetime.now().strftime("%Y%m%d_%H%M%S")[-6:])
+    output_dir = os.path.join(Config.BASE_OUTPUT_DIR + '/' + task_name, datetime.now().strftime("%Y%m%d_%H%M%S")[-6:])
     os.makedirs(output_dir, exist_ok=True)
     return output_dir

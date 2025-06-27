@@ -37,7 +37,7 @@ class ModelConfig:
     WEIGHT_DECAY = 0.01
     EARLY_STOPPING_PATIENCE = 2
     TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
-    BASE_OUTPUT_DIR = Config.BASE_OUTPUT_DIR +'/LLAMA_LoRA_MTL_MLP/'
+    OUTPUT_DIR = create_unique_dir('LLAMA_LoRA_MTL_MLP')
 
 
 class LlamaMLPModel(torch.nn.Module):
@@ -144,8 +144,7 @@ def main():
         if val_res['f1_macro'] > best_val_f1:
             best_val_f1 = val_res['f1_macro']
             patience_counter = 0
-            output_dir = create_unique_dir(ModelConfig.BASE_OUTPUT_DIR)
-            torch.save(model.state_dict(), os.path.join(output_dir, 'best_e2e_model.pt'))
+            torch.save(model.state_dict(), os.path.join(ModelConfig.OUTPUT_DIR, 'best_e2e_model.pt'))
             print(f"New best model saved with Val F1: {best_val_f1:.4f}")
         else:
             patience_counter += 1
@@ -158,7 +157,7 @@ def main():
     print("Optimal thresholds per trait:", optimal_thresholds)
 
     print("\n--- Evaluating best model on test sets ---")
-    model.load_state_dict(torch.load(os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt')))
+    model.load_state_dict(torch.load(os.path.join(ModelConfig.OUTPUT_DIR, 'best_e2e_model.pt')))
 
     Trainer.evaluate(model, test1_loader, device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
     Trainer.evaluate(model, test2_loader, device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
