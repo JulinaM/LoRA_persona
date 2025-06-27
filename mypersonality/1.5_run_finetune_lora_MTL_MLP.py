@@ -1,4 +1,4 @@
-import os, gc, json, sys
+import os, gc, sys
 import pandas as pd
 import numpy as np
 import torch
@@ -9,8 +9,7 @@ from transformers import (
     DataCollatorWithPadding,
 )
 from peft import get_peft_model, LoraConfig
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score
 from torch.optim import AdamW
 from torch.nn import BCEWithLogitsLoss
 import torch.nn.functional as F
@@ -28,28 +27,23 @@ class ModelConfig:
     # MLP Config
     HIDDEN_DIM = 512
     DROP_OUT = 0.5
+    POOLING_METHOD = "max"
     
     # Training Config
-    EPOCHS = 10
+    EPOCHS = 5
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
     LR = 0.00001 # A conservative learning rate for end-to-end training
     WEIGHT_DECAY = 0.01
-    EARLY_STOPPING_PATIENCE = 3
+    EARLY_STOPPING_PATIENCE = 2
     TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
     BASE_OUTPUT_DIR = Config.BASE_OUTPUT_DIR +'/LLAMA_LoRA_MTL_MLP/'
 
 
 class LlamaMLPModel(torch.nn.Module):
-
-    def __init__(self, model_checkpoint, num_labels, hidden_dim, drop_out=0.5):
+    def __init__(self, model_checkpoint, num_labels, hidden_dim, drop_out=0.5, pooling_method="mean"):
         super().__init__()
-        self.llama_base = AutoModel.from_pretrained(
-            model_checkpoint,
-            token=Config.get_hf_token(),
-            torch_dtype=torch.bfloat16,
-        )
-        
+        self.llama_base = AutoModel.from_pretrained(model_checkpoint, token=Config.get_hf_token(), torch_dtype=torch.bfloat16)
         lora_config = LoraConfig(
             r=ModelConfig.LORA_R,
             lora_alpha=ModelConfig.LORA_ALPHA,
@@ -59,33 +53,40 @@ class LlamaMLPModel(torch.nn.Module):
         )
         self.llama_peft = get_peft_model(self.llama_base, lora_config)
         self.llama_peft.print_trainable_parameters()
-        
+
+        hidden_dim = self.llama_peft.config.hidden_size
         self.mlp_head = torch.nn.Sequential(
-            torch.nn.Linear(self.llama_peft.config.hidden_size, hidden_dim),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Dropout(drop_out),
-            # torch.nn.Linear(hidden_dim, hidden_dim),
-            # torch.nn.ReLU(),
-            # torch.nn.Dropout(drop_out),
-            torch.nn.Linear(hidden_dim, num_labels)
+            torch.nn.Linear(hidden_dim, hidden_dim//2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(drop_out),
+            torch.nn.Linear(hidden_dim//2, num_labels)
         )
-        print("This is single layer MLP")
+        self.pooling_method = pooling_method
+        print(f"This is two layer MLP with {self.pooling_method} pooling method.")
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.llama_peft(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-        # Mean pooling of the last hidden state
-        last_hidden_state = outputs.hidden_states[-1]
-        mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        sum_embeddings = torch.sum(last_hidden_state * mask, 1)
-        sum_mask = torch.clamp(mask.sum(1), min=1e-9)
-        mean_pooled_embedding = sum_embeddings / sum_mask
+        outputs = self.llama_peft(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        if self.pooling_method == 'mean':
+            last_hidden_state = outputs.hidden_states[-1]
+            mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+            sum_embeddings = torch.sum(last_hidden_state * mask, 1)
+            sum_mask = torch.clamp(mask.sum(1), min=1e-9)
+            pooled_embedding = sum_embeddings / sum_mask
         
-        # Pass the pooled embedding through the MLP head
-        logits = self.mlp_head(mean_pooled_embedding)
+        elif self.pooling_method == 'max':
+            last_hidden_state = outputs.hidden_states[-1]
+            mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+            masked_embeddings = last_hidden_state * mask + (1 - mask) * -1e9  # Set padding to -inf
+            pooled_embedding = torch.max(masked_embeddings, dim=1).values  # [batch, hidden_dim]
+        
+        else:  
+            pooled_embedding = outputs.last_hidden_state[:, -1, :].float()
+
+        logits = self.mlp_head(pooled_embedding)
         return logits
 
 def main():
@@ -129,7 +130,8 @@ def main():
         model_checkpoint=Config.MODEL_CHECKPOINT,
         num_labels=len(Config.ALL_TARGET_COLUMNS),
         hidden_dim=ModelConfig.HIDDEN_DIM,
-        drop_out=ModelConfig.DROP_OUT
+        drop_out=ModelConfig.DROP_OUT,
+        pooling_method=ModelConfig.POOLING_METHOD
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=ModelConfig.LR, weight_decay=ModelConfig.WEIGHT_DECAY)
@@ -142,20 +144,15 @@ def main():
         model.train()
         total_loss = 0
         for i, batch in enumerate(train_loader):
-            labels = batch.pop("labels").to(device)
-            model_inputs = {
-                'input_ids': batch['input_ids'].to(device),
-                'attention_mask': batch['attention_mask'].to(device)
-            }
-            outputs = model(**model_inputs)
-            loss = criterion(outputs, labels)
-            loss = loss / ModelConfig.GRAD_ACCUM_STEPS # Scale loss
-            total_loss += loss.item()
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            optimizer.zero_grad()
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = criterion(logits, labels)
             loss.backward()
-
-            if (i + 1) % ModelConfig.GRAD_ACCUM_STEPS == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+            optimizer.step()
+            total_loss += loss.item()
 
         # Validation loop
         model.eval()
@@ -163,25 +160,22 @@ def main():
         v_total_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                labels = batch.pop("labels").to(device)
-                model_inputs = {
-                    'input_ids': batch['input_ids'].to(device),
-                    'attention_mask': batch['attention_mask'].to(device)
-                }
-                outputs = model(**model_inputs)
-                preds = (torch.sigmoid(outputs) > 0.5).int()
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                v_loss = criterion(logits, labels)
+                v_total_loss += v_loss.item()
+                preds = (torch.sigmoid(logits) > 0.5).int()
                 all_val_preds.append(preds.cpu())
                 all_val_labels.append(labels.cpu())
 
-                v_loss = criterion(outputs, labels)
-                v_loss = v_loss / ModelConfig.GRAD_ACCUM_STEPS 
-                v_total_loss += v_loss.item()
-        
         val_preds = torch.cat(all_val_preds).numpy()
         val_labels = torch.cat(all_val_labels).numpy()
         val_f1 = f1_score(val_labels, val_preds, average='micro')
+        val_acc = accuracy_score(val_labels, val_preds)
 
-        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {total_loss / len(train_loader):.4f}, Val Loss: {v_total_loss / len(val_loader):.4f}, Val F1: {val_f1:.4f}")
+        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {total_loss / len(train_loader):.4f}, Val Loss: {v_total_loss / len(val_loader):.4f}, Val F1: {val_f1:.4f}, Val Acc: {val_acc:.4f}")
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
@@ -210,13 +204,11 @@ def main():
         for split_name, loader in test_loaders.items():
             all_test_preds, all_test_labels = [], []
             for batch in loader:
-                labels = batch.pop("labels").to(device)
-                model_inputs = {
-                    'input_ids': batch['input_ids'].to(device),
-                    'attention_mask': batch['attention_mask'].to(device)
-                }
-                outputs = model(**model_inputs)
-                preds = (torch.sigmoid(outputs) > 0.5).int()
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                preds = (torch.sigmoid(logits) > 0.5).int()
                 all_test_preds.append(preds.cpu())
                 all_test_labels.append(labels.cpu())
             
