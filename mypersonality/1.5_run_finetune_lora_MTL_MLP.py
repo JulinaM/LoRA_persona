@@ -9,13 +9,14 @@ from transformers import (
     DataCollatorWithPadding,
 )
 from peft import get_peft_model, LoraConfig
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, precision_recall_curve
 from torch.optim import AdamW
 from torch.nn import BCEWithLogitsLoss
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 sys.path.insert(0,'/users/PGS0218/julina/projects/LoRA_persona')
 from utils.lora_utils import Config, load_and_prepare_all_data, compute_mtl_metrics
+from utils.trainer import Trainer
 
 
 class ModelConfig:
@@ -27,10 +28,10 @@ class ModelConfig:
     # MLP Config
     HIDDEN_DIM = 512
     DROP_OUT = 0.5
-    POOLING_METHOD = "max"
+    POOLING_METHOD = "mean"
     
     # Training Config
-    EPOCHS = 5
+    EPOCHS = 3
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
     LR = 0.00001 # A conservative learning rate for end-to-end training
@@ -58,7 +59,7 @@ class LlamaMLPModel(torch.nn.Module):
         self.mlp_head = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.LayerNorm(hidden_dim),
-            torch.nn.ReLU(),
+            torch.nn.ReLU(), #TODO GELU
             torch.nn.Dropout(drop_out),
             torch.nn.Linear(hidden_dim, hidden_dim//2),
             torch.nn.ReLU(),
@@ -88,6 +89,7 @@ class LlamaMLPModel(torch.nn.Module):
 
         logits = self.mlp_head(pooled_embedding)
         return logits
+
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,44 +143,12 @@ def main():
     patience_counter = 0
     print("\n--- Starting End-to-End Training ---")
     for epoch in range(ModelConfig.EPOCHS):
-        model.train()
-        total_loss = 0
-        for i, batch in enumerate(train_loader):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            optimizer.zero_grad()
-            logits = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        train_loss = Trainer.train_one_epoch(model, train_loader, optimizer, criterion, device)
+        val_res = Trainer.val_one_epoch(model, val_loader, criterion, device)
+        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: { val_res['loss']:.4f}, Val F1: {val_res['f1_macro']:.4f}, Val Acc: {val_res['accuracy']:.4f}")
 
-        # Validation loop
-        model.eval()
-        all_val_preds, all_val_labels = [], []
-        v_total_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
-                v_loss = criterion(logits, labels)
-                v_total_loss += v_loss.item()
-                preds = (torch.sigmoid(logits) > 0.5).int()
-                all_val_preds.append(preds.cpu())
-                all_val_labels.append(labels.cpu())
-
-        val_preds = torch.cat(all_val_preds).numpy()
-        val_labels = torch.cat(all_val_labels).numpy()
-        val_f1 = f1_score(val_labels, val_preds, average='micro')
-        val_acc = accuracy_score(val_labels, val_preds)
-
-        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {total_loss / len(train_loader):.4f}, Val Loss: {v_total_loss / len(val_loader):.4f}, Val F1: {val_f1:.4f}, Val Acc: {val_acc:.4f}")
-
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_res['f1_macro'] > best_val_f1:
+            best_val_f1 = val_res['f1_macro']
             patience_counter = 0
             os.makedirs(ModelConfig.BASE_OUTPUT_DIR, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt'))
@@ -190,49 +160,15 @@ def main():
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    # Final Evaluation
+    optimal_thresholds = Trainer.find_optimal_thresholds(model, val_loader, device)
+    print("Optimal thresholds per trait:", dict(zip(Config.ALL_TARGET_COLUMNS, optimal_thresholds)))
+
     print("\n--- Evaluating best model on test sets ---")
     model.load_state_dict(torch.load(os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt')))
-    model.eval()
 
-    test_loaders = {
-        "mypersonality": DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator),
-        "Essay": DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
-    }
-
-    with torch.no_grad():
-        for split_name, loader in test_loaders.items():
-            all_test_preds, all_test_labels = [], []
-            for batch in loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
-                preds = (torch.sigmoid(logits) > 0.5).int()
-                all_test_preds.append(preds.cpu())
-                all_test_labels.append(labels.cpu())
-            
-            test_preds = torch.cat(all_test_preds).numpy()
-            true_labels = torch.cat(all_test_labels).numpy()
-
-            f1_micro = f1_score(true_labels, test_preds, average='micro')
-            accuracy = accuracy_score(true_labels, test_preds)
-
-            print("\n" + "-"*50)
-            print(f"Final Test Set '{split_name}' Evaluation Results (Overall):")
-            print(f"  Subset Accuracy (Exact Match): {accuracy:.4f}")
-            print(f"  F1 Score (micro): {f1_micro:.4f}")
-            
-            print("\nPer-Trait Test Results:")
-            for i, trait in enumerate(Config.ALL_TARGET_COLUMNS):
-                trait_acc = accuracy_score(true_labels[:, i], test_preds[:, i])
-                trait_f1 = f1_score(true_labels[:, i], test_preds[:, i], average='binary')
-                
-                print(f"  --- {trait} ---")
-                print(f"    Accuracy: {trait_acc:.4f}")
-                print(f"    F1 Score: {trait_f1:.4f}")
-            print("-"*50)
-
+    Trainer.evaluate(model, DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, Config.ALL_TARGET_COLUMNS, 'mypersonality',  optimal_thresholds)
+    Trainer.evaluate(model, DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, Config.ALL_TARGET_COLUMNS, 'essay',  optimal_thresholds)
+  
     print("\n SCRIPT FINISHED ".center(80, "="))
 
 if __name__ == "__main__":
