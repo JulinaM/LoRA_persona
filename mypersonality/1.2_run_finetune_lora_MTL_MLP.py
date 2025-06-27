@@ -30,10 +30,10 @@ class ModelConfig:
     POOLING_METHOD = "max"
     
     # Training Config
-    EPOCHS = 3
+    EPOCHS = 5
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
-    LR = 0.00001 # A conservative learning rate for end-to-end training
+    LR = 0.00005 # A conservative learning rate for end-to-end training
     WEIGHT_DECAY = 0.01
     EARLY_STOPPING_PATIENCE = 2
     TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
@@ -159,14 +159,16 @@ def main():
     print("\n--- Evaluating best model on test sets ---")
     model.load_state_dict(torch.load(os.path.join(ModelConfig.OUTPUT_DIR, 'best_e2e_model.pt')))
 
-    Trainer.evaluate(model, test1_loader, device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
-    Trainer.evaluate(model, test2_loader, device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
+    Trainer.evaluate(model, test1_loader, device, Config.ALL_TARGET_COLUMNS, 'mypersonality')
+    Trainer.evaluate(model, test1_loader, device, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
+
+    Trainer.evaluate(model, test2_loader, device, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
   
     print("\n SCRIPT FINISHED ".center(80, "="))
 
 
 if __name__ == "__main__":
     main()
-    del model, model_lora, trainer
+    # del model, model_lora, trainer
     gc.collect()
     torch.cuda.empty_cache()

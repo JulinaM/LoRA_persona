@@ -29,12 +29,10 @@ exec > "$LOG_FILE" 2>&1
 # --- 3. SELECT PYTHON SCRIPT TO RUN ---
 PYTHON_SCRIPT=""
 case $SCRIPT_CHOICE in
-    # 9)
-    #     echo "Selected script #8: A eight script"
-    #     PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/0_run_finetune_bert_GCN.py" ;;
-    1)
-        echo "Selected script #1: run_lora.py"
-        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1_run_finetune_lora.py" ;;
+    # 1)
+    #     echo "Selected script #1: run_lora.py"
+    #     PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1_run_finetune_lora_MTL.py" ;;
+    # 
     2)
         echo "Selected script #2: Another script"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/2_run_finetune_roberta.py" ;;
@@ -44,9 +42,9 @@ case $SCRIPT_CHOICE in
     4)
         echo "Selected script #4: A fourth script"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/4_run_ml.py" ;;
-    5)
-        echo "Selected script #5: A fifth script"
-        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.1_run_finetune_BiLSTM_lora.py" ;;
+    # 5)
+    #     echo "Selected script #5: A fifth script"
+    #     PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.1_run_finetune_BiLSTM_lora.py" ;;
     6)
         echo "Selected script #6: A sixth script"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/2.1_run_finetune_full_BiLSTM.py" ;;
@@ -58,10 +56,10 @@ case $SCRIPT_CHOICE in
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.3_run_finetune_lora_MTL_GCN.py" ;;
     9)
         echo "Selected script #9: A ninth script"
-        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.4_run_finetune_lora_MTL.py" ;;
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1_run_finetune_lora_MTL.py" ;;
     10)
         echo "Selected script #10: A Tenth script"
-        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.5_run_finetune_lora_MTL_MLP.py" ;;
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.2_run_finetune_lora_MTL_MLP.py" ;;
     11)
         echo "Selected script #10: A 11 script"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.6_hyperparameter_tuning_lora_MTL_MLP.py" ;;

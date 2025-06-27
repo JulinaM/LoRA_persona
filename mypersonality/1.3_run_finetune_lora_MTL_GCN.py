@@ -33,10 +33,10 @@ class ModelConfig:
     POOLING_METHOD = "max"
 
     # Training Config
-    EPOCHS = 3
+    EPOCHS = 5
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
-    LR = 0.00001 # A conservative learning rate for end-to-end training
+    LR = 1e-5 # A conservative learning rate for end-to-end training
     WEIGHT_DECAY = 0.01
     EARLY_STOPPING_PATIENCE = 2
     TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
@@ -60,8 +60,9 @@ class LlamaGCNModel(torch.nn.Module):
         
         # GCN Layers
         emb_dim = self.llama_peft.config.hidden_size
-        self.conv1 = GCNConv(emb_dim, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, num_labels)
+        self.conv1 = GCNConv(emb_dim, emb_dim)
+        self.conv2 = GCNConv(emb_dim, emb_dim//2)
+        self.conv3 = GCNConv(emb_dim//2, num_labels)
         self.drop_out = drop_out
 
     def forward(self, input_ids, attention_mask):
@@ -89,12 +90,18 @@ class LlamaGCNModel(torch.nn.Module):
         x = F.relu(x)
         x = F.dropout(x, p=self.drop_out, training=self.training)
         x = self.conv2(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.drop_out, training=self.training)
+        x = self.conv3(x, edge_index)
         return x
 
     @staticmethod
     def build_graph(embeddings, k=5):
         """Build k-NN graph from embeddings"""
-        adj = kneighbors_graph(embeddings, k, mode='connectivity', include_self=False)
+        actual_k = min(k, len(embeddings) - 1)
+        if actual_k < 1:
+            return torch.empty((2, 0), dtype=torch.long)  # Empty graph
+        adj = kneighbors_graph(embeddings, actual_k, mode='connectivity', include_self=False)
         adj = adj.maximum(adj.T)  # Make symmetric
         edge_index = torch.tensor(np.array(adj.nonzero()), dtype=torch.long)
         return edge_index
@@ -125,7 +132,7 @@ def main():
     })
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    train_loader = DataLoader(dataset["train"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator, shuffle=True)
+    train_loader = DataLoader(dataset["train"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator, shuffle=True, drop_last=True)
     val_loader = DataLoader(dataset["validation"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
     test1_loader = DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
     test2_loader = DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
