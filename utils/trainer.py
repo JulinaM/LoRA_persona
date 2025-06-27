@@ -79,8 +79,7 @@ class Trainer:
                     for trait in trait_names:
                         preds[:, i] = (probs[:, i] >= optimal_thresholds[trait]).astype(int)  
                 else:
-                    preds = (torch.sigmoid(logits) > 0.5).int()
-                    preds = preds.to_numpy()
+                    preds = (probs > 0.5).int()
                 all_preds.append(preds)
                 all_labels.append(batch['labels'].cpu().numpy())
             
