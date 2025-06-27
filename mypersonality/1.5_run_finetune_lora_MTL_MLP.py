@@ -160,14 +160,14 @@ def main():
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    optimal_thresholds = Trainer.find_optimal_thresholds(model, val_loader, device)
-    print("Optimal thresholds per trait:", dict(zip(Config.ALL_TARGET_COLUMNS, optimal_thresholds)))
+    optimal_thresholds = Trainer.find_optimal_thresholds(model, val_loader, device, Config.ALL_TARGET_COLUMNS)
+    print("Optimal thresholds per trait:", optimal_thresholds)
 
     print("\n--- Evaluating best model on test sets ---")
     model.load_state_dict(torch.load(os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt')))
 
-    Trainer.evaluate(model, DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, Config.ALL_TARGET_COLUMNS, 'mypersonality',  optimal_thresholds)
-    Trainer.evaluate(model, DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, Config.ALL_TARGET_COLUMNS, 'essay',  optimal_thresholds)
+    Trainer.evaluate(model, DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
+    Trainer.evaluate(model, DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
   
     print("\n SCRIPT FINISHED ".center(80, "="))
 

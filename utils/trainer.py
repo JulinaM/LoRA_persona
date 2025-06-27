@@ -42,62 +42,53 @@ class Trainer:
         return {'loss': avg_val_loss, 'f1_macro': val_f1, "accuracy": val_acc}
     
 
-    def find_optimal_thresholds(model, val_loader, device):
-        """Find optimal sigmoid thresholds per trait using validation set."""
+    def find_optimal_thresholds(model, val_loader, device, trait_names):
+        """Returns a dict mapping trait names to optimal thresholds."""
         model.eval()
-        all_labels = []
-        all_probs = []
+        all_probs, all_labels = [], []
         with torch.no_grad():
             for batch in val_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                logits = model(input_ids, attention_mask)
+                logits = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device) )
                 probs = torch.sigmoid(logits)
                 all_probs.append(probs.cpu())
-                all_labels.append(labels.cpu())
-        all_probs = torch.cat(all_probs).numpy()  # Shape: [n_val_samples, n_traits]
+                all_labels.append(batch['labels'].cpu())
+        
+        all_probs = torch.cat(all_probs).numpy()  # Shape: [n_samples, n_traits]
         all_labels = torch.cat(all_labels).numpy()
         
-        optimal_thresholds = []
-        for i in range(all_labels.shape[1]):  # Loop per trait
+        optimal_thresholds = {}
+        for i, trait in enumerate(trait_names):
             precision, recall, thresholds = precision_recall_curve(
-                all_labels[:, i], 
-                all_probs[:, i]
+                all_labels[:, i], all_probs[:, i]
             )
-            # Calculate F1 for each threshold
             f1_scores = 2 * (precision * recall) / (precision + recall + 1e-9)
-            best_threshold = thresholds[np.argmax(f1_scores)]
-            optimal_thresholds.append(best_threshold)
+            optimal_idx = np.argmax(f1_scores)
+            optimal_thresholds[trait] = float(thresholds[optimal_idx])
         return optimal_thresholds
     
     
-    def evaluate(model, data_loader, device, labels, split_name, optimal_thresholds=None):
+    def evaluate(model, data_loader, device, trait_names, split_name, optimal_thresholds=None):
         model.eval()
-        all_test_preds, all_test_labels = [], []
+        all_preds, all_labels = [], []
         with torch.no_grad():
-
             for batch in data_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device) )
                 probs = torch.sigmoid(logits).cpu().numpy()  
                 if optimal_thresholds:
                     preds = np.zeros_like(probs)
-                    for i, threshold in enumerate(optimal_thresholds):
-                        preds[:, i] = (probs[:, i] >= threshold).astype(int)  
-                    preds = torch.from_numpy(preds)
+                    for trait in trait_names:
+                        preds[:, i] = (probs[:, i] >= optimal_thresholds[trait]).astype(int)  
                 else:
                     preds = (torch.sigmoid(logits) > 0.5).int()
-                all_test_preds.append(preds.cpu())
-                all_test_labels.append(labels.cpu())
+                    preds = preds.to_numpy()
+                all_preds.append(preds)
+                all_labels.append(batch['labels'].cpu().numpy())
             
-            test_preds = torch.cat(all_test_preds).numpy()
-            true_labels = torch.cat(all_test_labels).numpy()
+            all_preds = np.concatenate(all_preds, axis=0)
+            all_labels = np.concatenate(all_labels, axis=0)
 
-            f1_micro = f1_score(true_labels, test_preds, average='micro')
-            accuracy = accuracy_score(true_labels, test_preds)
+            f1_micro = f1_score(all_labels, all_preds, average='micro')
+            accuracy = accuracy_score(all_labels, all_preds)
 
             print("\n" + "-"*50)
             print(f"Final Test Set '{split_name}' Evaluation Results (Overall):")
@@ -105,9 +96,9 @@ class Trainer:
             print(f"  F1 Score (micro): {f1_micro:.4f}")
             
             print("\nPer-Trait Test Results:")
-            for i, trait in enumerate(labels):
-                trait_acc = accuracy_score(true_labels[:, i], test_preds[:, i])
-                trait_f1 = f1_score(true_labels[:, i], test_preds[:, i], average='binary')
+            for i, trait in enumerate(trait_names):
+                trait_acc = accuracy_score(all_labels[:, i], all_preds[:, i])
+                trait_f1 = f1_score(all_labels[:, i], all_preds[:, i], average='binary')
                 
                 print(f"  --- {trait} ---")
                 print(f"    Accuracy: {trait_acc:.4f}")
