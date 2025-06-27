@@ -93,6 +93,17 @@ def load_and_prepare_all_data(split_ratio=0.1, both=False):
     return train1, val1, test1_df, test2_df
 
 
+def compute_pos_weight(train_df, device):
+    labels_df = train_df[Config.ALL_TARGET_COLUMNS]
+    pos_counts = labels_df.sum()
+    neg_counts = len(labels_df) - pos_counts
+    pos_weight = neg_counts / (pos_counts + 1e-8) # Clamp to avoid division by zero if a class has 0 positive samples
+    pos_weight_tensor = torch.tensor(pos_weight.values, dtype=torch.float).to(device)
+    print("\nCalculated positive class weights for weighted loss:")
+    print(pos_weight)
+    return pos_weight_tensor
+
+
 def compute_metrics(p):
     preds = np.argmax(p.predictions, axis=1)
     labels = p.label_ids
@@ -119,7 +130,8 @@ def compute_mtl_metrics(p):
     }
     return metrics
 
-def create_out_dir(target_trait):
-    output_dir_trait = os.path.join(Config.BASE_OUTPUT_DIR, target_trait)
-    os.makedirs(output_dir_trait, exist_ok=True)
-    return output_dir_trait
+def create_unique_dir(base_dir):
+    from datetime import datetime
+    output_dir = os.path.join(base_dir, datetime.now().strftime("%Y%m%d_%H%M%S")[-6:])
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir

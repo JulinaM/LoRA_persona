@@ -9,13 +9,12 @@ from transformers import (
     DataCollatorWithPadding,
 )
 from peft import get_peft_model, LoraConfig
-from sklearn.metrics import f1_score, accuracy_score, precision_recall_curve
 from torch.optim import AdamW
 from torch.nn import BCEWithLogitsLoss
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 sys.path.insert(0,'/users/PGS0218/julina/projects/LoRA_persona')
-from utils.lora_utils import Config, load_and_prepare_all_data, compute_mtl_metrics
+from utils.lora_utils import Config, load_and_prepare_all_data, compute_pos_weight, create_unique_dir
 from utils.trainer import Trainer
 
 
@@ -28,7 +27,7 @@ class ModelConfig:
     # MLP Config
     HIDDEN_DIM = 512
     DROP_OUT = 0.5
-    POOLING_METHOD = "mean"
+    POOLING_METHOD = "max"
     
     # Training Config
     EPOCHS = 3
@@ -102,14 +101,6 @@ def main():
 
     train_df, val_df, test1_df, test2_df = load_and_prepare_all_data(0.1)
     print(f"\nData split into {len(train_df)} train, {len(val_df)} validation, and test sets.")
-    
-    labels_df = train_df[Config.ALL_TARGET_COLUMNS]
-    pos_counts = labels_df.sum()
-    neg_counts = len(labels_df) - pos_counts
-    pos_weight = neg_counts / (pos_counts + 1e-8) # Clamp to avoid division by zero if a class has 0 positive samples
-    pos_weight_tensor = torch.tensor(pos_weight.values, dtype=torch.float).to(device)
-    print("\nCalculated positive class weights for weighted loss:")
-    print(pos_weight)
 
     def preprocess_function(examples):
         tokenized_inputs = tokenizer(examples['text'], truncation=True, max_length=ModelConfig.TOKEN_MAX_LEN)
@@ -127,6 +118,8 @@ def main():
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     train_loader = DataLoader(dataset["train"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(dataset["validation"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
+    test1_loader = DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
+    test2_loader = DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
 
     model = LlamaMLPModel(
         model_checkpoint=Config.MODEL_CHECKPOINT,
@@ -137,6 +130,7 @@ def main():
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=ModelConfig.LR, weight_decay=ModelConfig.WEIGHT_DECAY)
+    pos_weight_tensor = compute_pos_weight(train_df, device)
     criterion = BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 
     best_val_f1 = 0
@@ -150,8 +144,8 @@ def main():
         if val_res['f1_macro'] > best_val_f1:
             best_val_f1 = val_res['f1_macro']
             patience_counter = 0
-            os.makedirs(ModelConfig.BASE_OUTPUT_DIR, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt'))
+            output_dir = create_unique_dir(ModelConfig.BASE_OUTPUT_DIR)
+            torch.save(model.state_dict(), os.path.join(output_dir, 'best_e2e_model.pt'))
             print(f"New best model saved with Val F1: {best_val_f1:.4f}")
         else:
             patience_counter += 1
@@ -166,10 +160,14 @@ def main():
     print("\n--- Evaluating best model on test sets ---")
     model.load_state_dict(torch.load(os.path.join(ModelConfig.BASE_OUTPUT_DIR, 'best_e2e_model.pt')))
 
-    Trainer.evaluate(model, DataLoader(dataset['test1'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
-    Trainer.evaluate(model, DataLoader(dataset['test2'], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator), device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
+    Trainer.evaluate(model, test1_loader, device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
+    Trainer.evaluate(model, test2_loader, device, optimal_thresholds, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
   
     print("\n SCRIPT FINISHED ".center(80, "="))
 
+
 if __name__ == "__main__":
     main()
+    del model, model_lora, trainer
+    gc.collect()
+    torch.cuda.empty_cache()
