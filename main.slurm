@@ -55,10 +55,19 @@ case $SCRIPT_CHOICE in
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/2.2_run_finetune_full_MLP.py" ;;
     8)
         echo "Selected script #8: A eight script"
-        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.3_run_finetune_lora_GCN.py" ;;
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.3_run_finetune_lora_MTL_GCN.py" ;;
     9)
         echo "Selected script #9: A ninth script"
         PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.4_run_finetune_lora_MTL.py" ;;
+    10)
+        echo "Selected script #10: A Tenth script"
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.5_run_finetune_lora_MTL_MLP.py" ;;
+    11)
+        echo "Selected script #10: A 11 script"
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/1.6_hyperparameter_tuning_lora_MTL_MLP.py" ;;
+    12)
+        echo "Selected script #10: A 12 script"
+        PYTHON_SCRIPT="/users/PGS0218/julina/projects/LoRA_persona/mypersonality/5_run_prompt_tuning.py" ;;
  
     *)
         echo "Error: Invalid script choice '${SCRIPT_CHOICE}'."

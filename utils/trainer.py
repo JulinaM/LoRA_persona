@@ -7,16 +7,15 @@ class Trainer:
         model.train()
         total_loss = 0
         for batch in train_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
             optimizer.zero_grad()
-            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device) )
+            labels = batch['labels'].to(device)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
         return total_loss / len(train_loader)
+
 
     def val_one_epoch(model, data_loader, criterion, device):
         model.eval()
@@ -24,10 +23,8 @@ class Trainer:
         v_total_loss = 0
         with torch.no_grad():
             for batch in data_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
                 labels = batch['labels'].to(device)
-                logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device) )
                 v_loss = criterion(logits, labels)
                 v_total_loss += v_loss.item()
                 preds = (torch.sigmoid(logits) > 0.5).int()
@@ -75,11 +72,12 @@ class Trainer:
                 logits = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device) )
                 probs = torch.sigmoid(logits).cpu().numpy()  
                 if optimal_thresholds:
+                    print("Using thresholds")
                     preds = np.zeros_like(probs)
-                    for trait in trait_names:
+                    for i, trait in enumerate(trait_names): 
                         preds[:, i] = (probs[:, i] >= optimal_thresholds[trait]).astype(int)  
                 else:
-                    preds = (probs > 0.5).int()
+                    preds = (probs > 0.5).astype(int)
                 all_preds.append(preds)
                 all_labels.append(batch['labels'].cpu().numpy())
             
