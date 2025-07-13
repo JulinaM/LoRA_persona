@@ -3,6 +3,7 @@ from sklearn.metrics import f1_score, accuracy_score, precision_recall_curve
 import numpy as np
 
 class Trainer:
+    # max_grad_norm = 1.0
     def train_one_epoch(model, train_loader, optimizer, criterion, device):
         model.train()
         total_loss = 0
@@ -12,6 +13,7 @@ class Trainer:
             labels = batch['labels'].to(device)
             loss = criterion(logits, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
         return total_loss / len(train_loader)
@@ -66,23 +68,22 @@ class Trainer:
     
     def evaluate(model, data_loader, device, trait_names, split_name, optimal_thresholds=None):
         model.eval()
-        all_preds, all_labels = [], []
+        all_preds, all_labels = [], []        
         with torch.no_grad():
             for batch in data_loader:
                 logits = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device) )
-                probs = torch.sigmoid(logits).cpu().numpy()  
                 if optimal_thresholds:
-                    print("Using thresholds")
-                    preds = np.zeros_like(probs)
+                    probs = torch.sigmoid(logits).cpu() 
+                    preds = torch.zeros_like(probs)
                     for i, trait in enumerate(trait_names): 
-                        preds[:, i] = (probs[:, i] >= optimal_thresholds[trait]).astype(int)  
+                        preds[:, i] = (probs[:, i] >= optimal_thresholds[trait]).int()
                 else:
-                    preds = (probs > 0.5).astype(int)
-                all_preds.append(preds)
-                all_labels.append(batch['labels'].cpu().numpy())
+                    preds = (torch.sigmoid(logits) > 0.5).int()
+                all_preds.append(preds.cpu())
+                all_labels.append(batch['labels'].to(device).cpu())
             
-            all_preds = np.concatenate(all_preds, axis=0)
-            all_labels = np.concatenate(all_labels, axis=0)
+            all_preds = torch.cat(all_preds).numpy()
+            all_labels = torch.cat(all_labels).numpy()
 
             f1_micro = f1_score(all_labels, all_preds, average='micro')
             accuracy = accuracy_score(all_labels, all_preds)
@@ -91,6 +92,7 @@ class Trainer:
             print(f"Final Test Set '{split_name}' Evaluation Results (Overall):")
             print(f"  Subset Accuracy (Exact Match): {accuracy:.4f}")
             print(f"  F1 Score (micro): {f1_micro:.4f}")
+            print(f'Using {optimal_thresholds}')
             
             print("\nPer-Trait Test Results:")
             for i, trait in enumerate(trait_names):
