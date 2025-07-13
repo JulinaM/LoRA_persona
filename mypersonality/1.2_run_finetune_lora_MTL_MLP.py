@@ -23,17 +23,18 @@ class ModelConfig:
     LORA_R = 64
     LORA_ALPHA = 128
     LORA_DROPOUT = 0.1
+    LORA_LR= 2e-4
     
     # MLP Config
     HIDDEN_DIM = 512
     DROP_OUT = 0.5
-    POOLING_METHOD = "max"
+    POOLING_METHOD = "mean"
     
     # Training Config
-    EPOCHS = 5
+    EPOCHS = 8
     BATCH_SIZE = 4 # This is the per-device batch size
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
-    LR = 0.00005 # A conservative learning rate for end-to-end training
+    LR = 2e-5 # A conservative learning rate for end-to-end training
     WEIGHT_DECAY = 0.01
     EARLY_STOPPING_PATIENCE = 2
     TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
@@ -53,17 +54,17 @@ class LlamaMLPModel(torch.nn.Module):
         )
         self.llama_peft = get_peft_model(self.llama_base, lora_config)
         self.llama_peft.print_trainable_parameters()
+        emb_dim = self.llama_peft.config.hidden_size
 
-        hidden_dim = self.llama_peft.config.hidden_size
-        self.mlp_head = torch.nn.Sequential(
-            torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.LayerNorm(hidden_dim),
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(emb_dim, emb_dim),
+            torch.nn.LayerNorm(emb_dim),
             torch.nn.ReLU(), #TODO GELU
             torch.nn.Dropout(drop_out),
-            torch.nn.Linear(hidden_dim, hidden_dim//2),
+            torch.nn.Linear(emb_dim, emb_dim//2),
             torch.nn.ReLU(),
             torch.nn.Dropout(drop_out),
-            torch.nn.Linear(hidden_dim//2, num_labels)
+            torch.nn.Linear(emb_dim//2, num_labels)
         )
         self.pooling_method = pooling_method
         print(f"This is two layer MLP with {self.pooling_method} pooling method.")
@@ -86,7 +87,7 @@ class LlamaMLPModel(torch.nn.Module):
         else:  
             pooled_embedding = outputs.last_hidden_state[:, -1, :].float()
 
-        logits = self.mlp_head(pooled_embedding)
+        logits = self.mlp(pooled_embedding)
         return logits
 
 
@@ -94,6 +95,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Using config: {ModelConfig.LR}")
+    print(f'output folde: {ModelConfig.OUTPUT_DIR}')
 
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
     if tokenizer.pad_token is None:
@@ -129,9 +131,27 @@ def main():
         pooling_method=ModelConfig.POOLING_METHOD
     ).to(device)
 
+    # optimizer_params = [
+    #     {
+    #         "params": [p for n, p in model.llama_peft.named_parameters() if "lora_" in n],
+    #         "lr": ModelConfig.LORA_LR,  # Lower learning rate for LoRA params
+    #         "weight_decay": 0.0  # Often LoRA params don't use weight decay
+    #     },
+    #     {
+    #         "params": list(model.mlp.parameters()),
+    #         # "params": [p for n,p in model.named_parameters() if 'mlp' in n],
+    #         "lr": ModelConfig.LR,  # Higher learning rate for MLP
+    #         "weight_decay": ModelConfig.WEIGHT_DECAY
+    #     },
+    # ]
+    # optimizer = AdamW(optimizer_params)
     optimizer = AdamW(model.parameters(), lr=ModelConfig.LR, weight_decay=ModelConfig.WEIGHT_DECAY)
     pos_weight_tensor = compute_pos_weight(train_df, device)
     criterion = BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    # print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
+    # print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    # for i, group in enumerate(optimizer.param_groups):
+    #     print(f"Group {i}: LR={group['lr']}, #Params={sum(p.numel() for p in group['params'])}")
 
     best_val_f1 = 0
     patience_counter = 0
@@ -153,17 +173,15 @@ def main():
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    optimal_thresholds = Trainer.find_optimal_thresholds(model, val_loader, device, Config.ALL_TARGET_COLUMNS)
-    print("Optimal thresholds per trait:", optimal_thresholds)
+    # optimal_thresholds = Trainer.find_optimal_thresholds(model, val_loader, device, Config.ALL_TARGET_COLUMNS)
+    # print("Optimal thresholds per trait:", optimal_thresholds)
 
     print("\n--- Evaluating best model on test sets ---")
     model.load_state_dict(torch.load(os.path.join(ModelConfig.OUTPUT_DIR, 'best_e2e_model.pt')))
 
     Trainer.evaluate(model, test1_loader, device, Config.ALL_TARGET_COLUMNS, 'mypersonality')
-    Trainer.evaluate(model, test1_loader, device, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
-
-    Trainer.evaluate(model, test2_loader, device, Config.ALL_TARGET_COLUMNS, 'essay', optimal_thresholds)
-  
+    # Trainer.evaluate(model, test1_loader, device, Config.ALL_TARGET_COLUMNS, 'mypersonality', optimal_thresholds)
+    Trainer.evaluate(model, test2_loader, device, Config.ALL_TARGET_COLUMNS, 'essay')
     print("\n SCRIPT FINISHED ".center(80, "="))
 
 
