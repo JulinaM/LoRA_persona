@@ -7,6 +7,7 @@ from transformers import (
     AutoTokenizer,
     AutoModel,
     DataCollatorWithPadding,
+    get_cosine_schedule_with_warmup, 
 )
 from peft import get_peft_model, LoraConfig
 from torch.optim import AdamW
@@ -20,25 +21,26 @@ from utils.trainer import Trainer
 
 class ModelConfig:
     # LoRA Config
-    LORA_R = 64
-    LORA_ALPHA = 128
+    LORA_R = 32
+    LORA_ALPHA = 64
     LORA_DROPOUT = 0.1
-    LORA_LR= 2e-4
-    
+    LORA_LR = 2e-4 
+
     # MLP Config
     HIDDEN_DIM = 512
-    DROP_OUT = 0.5
+    DROP_OUT = 0.3
     POOLING_METHOD = "mean"
     
     # Training Config
     EPOCHS = 8
-    BATCH_SIZE = 4 # This is the per-device batch size
+    BATCH_SIZE = 4
     GRAD_ACCUM_STEPS = 8 # Effective batch size = 32
-    LR = 2e-5 # A conservative learning rate for end-to-end training
+    LR = 2e-5 # Lower LR for the new MLP head
     WEIGHT_DECAY = 0.01
+    WARMUP_STEPS = 0 # NEW: Number of warmup steps for the scheduler
     EARLY_STOPPING_PATIENCE = 2
-    TOKEN_MAX_LEN = 128 # Config.TOKEN_MAX_LEN 512
-    OUTPUT_DIR = create_unique_dir('LLAMA_LoRA_MTL_MLP')
+    TOKEN_MAX_LEN = 128
+    OUTPUT_DIR = create_unique_dir('LLAMA_LoRA_MTL_MLP_v2')
 
 
 class LlamaMLPModel(torch.nn.Module):
@@ -56,18 +58,13 @@ class LlamaMLPModel(torch.nn.Module):
         self.llama_peft.print_trainable_parameters()
         emb_dim = self.llama_peft.config.hidden_size
 
+        # MODIFIED: Simplified MLP Head for stability and to prevent overfitting
         self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(emb_dim, emb_dim),
-            torch.nn.LayerNorm(emb_dim),
-            torch.nn.ReLU(), #TODO GELU
             torch.nn.Dropout(drop_out),
-            torch.nn.Linear(emb_dim, emb_dim//2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(drop_out),
-            torch.nn.Linear(emb_dim//2, num_labels)
+            torch.nn.Linear(emb_dim, num_labels)
         )
         self.pooling_method = pooling_method
-        print(f"This is two layer MLP with {self.pooling_method} pooling method.")
+        print(f"This is a simplified MLP with {self.pooling_method} pooling method.")
 
     def forward(self, input_ids, attention_mask):
         outputs = self.llama_peft(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -94,16 +91,16 @@ class LlamaMLPModel(torch.nn.Module):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"Using config: {ModelConfig.LR}")
-    print(f'output folde: {ModelConfig.OUTPUT_DIR}')
+    print(f"Using config with differential LRs: LoRA={ModelConfig.LORA_LR}, MLP={ModelConfig.LR}")
+    print(f'Output folder: {ModelConfig.OUTPUT_DIR}')
 
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT, token=Config.get_hf_token())
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_df, val_df, test1_df, test2_df = load_and_prepare_all_data(0.1)
-    print(f"\nData split into {len(train_df)} train, {len(val_df)} validation, and test sets.")
-
+    
+    # Preprocessing remains the same...
     def preprocess_function(examples):
         tokenized_inputs = tokenizer(examples['text'], truncation=True, max_length=ModelConfig.TOKEN_MAX_LEN)
         labels = np.array([examples[col] for col in Config.ALL_TARGET_COLUMNS])
@@ -116,7 +113,7 @@ def main():
         'test1': Dataset.from_pandas(test1_df).map(preprocess_function, batched=True, remove_columns=["text"] + Config.ALL_TARGET_COLUMNS),
         'test2': Dataset.from_pandas(test2_df).map(preprocess_function, batched=True,remove_columns=["text"] + Config.ALL_TARGET_COLUMNS),
     })
-
+    
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     train_loader = DataLoader(dataset["train"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(dataset["validation"], batch_size=ModelConfig.BATCH_SIZE, collate_fn=data_collator)
@@ -131,35 +128,64 @@ def main():
         pooling_method=ModelConfig.POOLING_METHOD
     ).to(device)
 
-    # optimizer_params = [
-    #     {
-    #         "params": [p for n, p in model.llama_peft.named_parameters() if "lora_" in n],
-    #         "lr": ModelConfig.LORA_LR,  # Lower learning rate for LoRA params
-    #         "weight_decay": 0.0  # Often LoRA params don't use weight decay
-    #     },
-    #     {
-    #         "params": list(model.mlp.parameters()),
-    #         # "params": [p for n,p in model.named_parameters() if 'mlp' in n],
-    #         "lr": ModelConfig.LR,  # Higher learning rate for MLP
-    #         "weight_decay": ModelConfig.WEIGHT_DECAY
-    #     },
-    # ]
-    # optimizer = AdamW(optimizer_params)
-    optimizer = AdamW(model.parameters(), lr=ModelConfig.LR, weight_decay=ModelConfig.WEIGHT_DECAY)
+    # NEW: Correctly set up differential learning rates
+    optimizer_params = [
+        {
+            "params": [p for n, p in model.llama_peft.named_parameters() if "lora_" in n],
+            "lr": ModelConfig.LORA_LR,  # Lower learning rate for LoRA params
+            "weight_decay": 0.0  # Often LoRA params don't use weight decay
+        },
+        {
+            "params": list(model.mlp.parameters()),
+            # "params": [p for n,p in model.named_parameters() if 'mlp' in n],
+            "lr": ModelConfig.LR,  # Higher learning rate for MLP
+            "weight_decay": ModelConfig.WEIGHT_DECAY
+        },
+    ]
+    optimizer = AdamW(optimizer_params)
+    # optimizer = AdamW(model.parameters(), lr=ModelConfig.LR, weight_decay=ModelConfig.WEIGHT_DECAY)
+
+    # NEW: Set up the learning rate scheduler
+    num_training_steps = ModelConfig.EPOCHS * (len(train_loader) // ModelConfig.GRAD_ACCUM_STEPS)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=ModelConfig.WARMUP_STEPS,
+        num_training_steps=num_training_steps
+    )
+    
     pos_weight_tensor = compute_pos_weight(train_df, device)
     criterion = BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    # print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
-    # print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    # for i, group in enumerate(optimizer.param_groups):
-    #     print(f"Group {i}: LR={group['lr']}, #Params={sum(p.numel() for p in group['params'])}")
-
+    
     best_val_f1 = 0
     patience_counter = 0
     print("\n--- Starting End-to-End Training ---")
     for epoch in range(ModelConfig.EPOCHS):
-        train_loss = Trainer.train_one_epoch(model, train_loader, optimizer, criterion, device)
+        model.train()
+        total_train_loss = 0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(train_loader):
+            inputs = {k: v.to(device) for k, v in batch.items() if k != 'labels'}
+            labels = batch['labels'].to(device)
+            
+            logits = model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
+            loss = criterion(logits, labels)
+            
+            # Normalize loss for accumulation
+            loss = loss / ModelConfig.GRAD_ACCUM_STEPS
+            total_train_loss += loss.item()
+            loss.backward()
+
+            # Perform optimizer step after accumulating gradients
+            if (step + 1) % ModelConfig.GRAD_ACCUM_STEPS == 0:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+        avg_train_loss = total_train_loss / len(train_loader)
+        
         val_res = Trainer.val_one_epoch(model, val_loader, criterion, device)
-        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: { val_res['loss']:.4f}, Val F1: {val_res['f1_macro']:.4f}, Val Acc: {val_res['accuracy']:.4f}")
+        print(f"Epoch {epoch+1}/{ModelConfig.EPOCHS}, Train Loss: {avg_train_loss:.4f}, Val Loss: {val_res['loss']:.4f}, Val F1: {val_res['f1_macro']:.4f}, Val Acc: {val_res['accuracy']:.4f}")
 
         if val_res['f1_macro'] > best_val_f1:
             best_val_f1 = val_res['f1_macro']
